@@ -8,6 +8,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
@@ -22,6 +23,7 @@
 #include "simple_ftl.h"
 #include "kv_ftl.h"
 #include "dma.h"
+#include "mqsim_ipc.h"
 
 /****************************************************************
  * Memory Layout
@@ -45,6 +47,10 @@
  *
  * Storage area
  *
+ * NVMeVirt stores device data in a reserved physical DRAM range instead of
+ * a regular file. The first 1 MiB is used for virtual PCI/NVMe metadata,
+ * and the rest is exposed as the virtual SSD backing store.
+ *
  ****************************************************************/
 
 /****************************************************************
@@ -52,13 +58,36 @@
  ****************************************************************
  * 1. Memmap start
  * 2. Memmap size
+ *
+ * This file also defines the module parameters passed at insmod time.
+ * memmap_start and memmap_size must match the physical memory range reserved
+ * by the kernel command line.
  ****************************************************************/
 
+/*
+ * Global virtual device handle.
+ *
+ * Other NVMeVirt components use this pointer to access shared state such as
+ * queues, namespaces, BARs, and the storage mapping.
+ */
 struct nvmev_dev *nvmev_vdev = NULL;
+static bool storage_mapped_with_ioremap;
 
+/*
+ * Reserved memory range passed at insmod time.
+ *
+ * These values are physical addresses/sizes. NVMEV_STORAGE_INIT() maps the
+ * range into kernel virtual address space with memremap().
+ */
 static unsigned long memmap_start = 0;
 static unsigned long memmap_size = 0;
 
+/*
+ * Read/write latency knobs for NVMeVirt's local timing model.
+ *
+ * When MQSim IPC is enabled and the daemon replies successfully, io.c uses
+ * the daemon-provided latency to override the local completion target.
+ */
 static unsigned int read_time = 1;
 static unsigned int read_delay = 1;
 static unsigned int read_trailing = 0;
@@ -67,14 +96,38 @@ static unsigned int write_time = 1;
 static unsigned int write_delay = 1;
 static unsigned int write_trailing = 0;
 
+/*
+ * Parallel resources for NVMeVirt's local performance model.
+ *
+ * These are simplified bandwidth/parallelism knobs and should not be treated
+ * as NAND LUNs or dies.
+ */
 static unsigned int nr_io_units = 8;
 static unsigned int io_unit_shift = 12;
 
+/*
+ * CPU binding for NVMeVirt kernel threads.
+ *
+ * The first CPU is used for the dispatcher, and the remaining CPUs are used
+ * for I/O workers. Experiments often pair this with isolcpus to reduce
+ * scheduler noise.
+ */
 static char *cpus;
 static unsigned int debug = 0;
 
+/*
+ * Selects the data movement path.
+ *
+ * false uses memcpy between host PRP buffers and the backing store; true tries
+ * to use the ioat DMA engine.
+ */
 int io_using_dma = false;
 
+/*
+ * Custom parser for memory-sized module parameters.
+ *
+ * memparse() accepts strings such as "64G" or "128M".
+ */
 static int set_parse_mem_param(const char *val, const struct kernel_param *kp)
 {
 	unsigned long *arg = (unsigned long *)kp->arg;
@@ -82,11 +135,26 @@ static int set_parse_mem_param(const char *val, const struct kernel_param *kp)
 	return 0;
 }
 
+/*
+ * Hooks the custom parser into module_param_cb().
+ *
+ * .set converts the user-provided string to an unsigned long, and .get exposes
+ * the current value through sysfs parameter files.
+ */
 static struct kernel_param_ops ops_parse_mem_param = {
 	.set = set_parse_mem_param,
 	.get = param_get_ulong,
 };
 
+/*
+ * Module parameters configurable through insmod/modprobe.
+ *
+ * Example:
+ *   sudo insmod nvmev.ko memmap_start=128G memmap_size=64G cpus=7,8
+ *
+ * 0444/0644 are sysfs permissions. 0644 parameters can be updated after module
+ * load; 0444 parameters are read-only after load.
+ */
 module_param_cb(memmap_start, &ops_parse_mem_param, &memmap_start, 0444);
 MODULE_PARM_DESC(memmap_start, "Reserved memory address");
 module_param_cb(memmap_size, &ops_parse_mem_param, &memmap_size, 0444);
@@ -111,7 +179,15 @@ module_param(cpus, charp, 0444);
 MODULE_PARM_DESC(cpus, "CPU list for process, completion(int.) threads, Seperated by Comma(,)");
 module_param(debug, uint, 0644);
 
-// Returns true if an event is processed
+/*
+ * Polls NVMe doorbell registers and dispatches newly submitted commands.
+ *
+ * Host submissions advance SQ tail doorbells, and host completion processing
+ * advances CQ head doorbells. This function detects those changes and routes
+ * them to the admin or I/O queue handlers.
+ *
+ * Returns true if any queue event was processed.
+ */
 static bool nvmev_proc_dbs(void)
 {
 	int qid;
@@ -120,13 +196,25 @@ static bool nvmev_proc_dbs(void)
 	int old_db;
 	bool updated = false;
 
-	// Admin queue
+	/*
+	 * Admin submission queue doorbell.
+	 *
+	 * Queue 0 handles control commands such as identify, create queue, and
+	 * set features; it is not used for normal data I/O.
+	 */
 	new_db = nvmev_vdev->dbs[0];
 	if (new_db != nvmev_vdev->old_dbs[0]) {
 		nvmev_proc_admin_sq(new_db, nvmev_vdev->old_dbs[0]);
 		nvmev_vdev->old_dbs[0] = new_db;
 		updated = true;
 	}
+
+	/*
+	 * Admin completion queue doorbell.
+	 *
+	 * The host advances the CQ head after consuming admin completions, and
+	 * NVMeVirt records that progress here.
+	 */
 	new_db = nvmev_vdev->dbs[1];
 	if (new_db != nvmev_vdev->old_dbs[1]) {
 		nvmev_proc_admin_cq(new_db, nvmev_vdev->old_dbs[1]);
@@ -134,7 +222,13 @@ static bool nvmev_proc_dbs(void)
 		updated = true;
 	}
 
-	// Submission queues
+	/*
+	 * I/O submission queues.
+	 *
+	 * Queues with qid >= 1 are data-path queues. When an SQ tail changes,
+	 * nvmev_proc_io_sq() parses new commands, asks the namespace timing model,
+	 * and enqueues work for the I/O workers.
+	 */
 	for (qid = 1; qid <= nvmev_vdev->nr_sq; qid++) {
 		if (nvmev_vdev->sqes[qid] == NULL)
 			continue;
@@ -147,7 +241,12 @@ static bool nvmev_proc_dbs(void)
 		}
 	}
 
-	// Completion queues
+	/*
+	 * I/O completion queues.
+	 *
+	 * The host advances CQ heads after consuming CQEs. NVMeVirt uses this path
+	 * mainly to maintain in-flight queue statistics.
+	 */
 	for (qid = 1; qid <= nvmev_vdev->nr_cq; qid++) {
 		if (nvmev_vdev->cqes[qid] == NULL)
 			continue;
@@ -164,6 +263,13 @@ static bool nvmev_proc_dbs(void)
 	return updated;
 }
 
+/*
+ * Main loop of the dispatcher kernel thread.
+ *
+ * The dispatcher polls host-visible state: BAR accesses and doorbell updates.
+ * It does not move payload data or fill I/O completions directly; it acts as
+ * the front-end event pump for the admin and I/O paths.
+ */
 static int nvmev_dispatcher(void *data)
 {
 	static unsigned long last_dispatched_time = 0;
@@ -188,6 +294,12 @@ static int nvmev_dispatcher(void *data)
 	return 0;
 }
 
+/*
+ * Creates and starts the dispatcher thread.
+ *
+ * If CPU binding is configured, the dispatcher is bound to the first CPU in
+ * the cpus parameter to reduce scheduling noise.
+ */
 static void NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	nvmev_vdev->nvmev_dispatcher = kthread_create(nvmev_dispatcher, NULL, "nvmev_dispatcher");
@@ -196,6 +308,9 @@ static void NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
 	wake_up_process(nvmev_vdev->nvmev_dispatcher);
 }
 
+/*
+ * Stops the dispatcher thread during unload or error cleanup.
+ */
 static void NVMEV_DISPATCHER_FINAL(struct nvmev_dev *nvmev_vdev)
 {
 	if (!IS_ERR_OR_NULL(nvmev_vdev->nvmev_dispatcher)) {
@@ -205,6 +320,13 @@ static void NVMEV_DISPATCHER_FINAL(struct nvmev_dev *nvmev_vdev)
 }
 
 #ifdef CONFIG_X86
+/*
+ * x86-specific reserved memory validation.
+ *
+ * NVMeVirt requires the configured physical range to be E820_TYPE_RESERVED so
+ * Linux will not allocate it as normal RAM. A failure here usually means the
+ * boot-time memmap setting and insmod parameters do not match.
+ */
 static int __validate_configs_arch(void)
 {
 	unsigned long resv_start_bytes;
@@ -237,6 +359,9 @@ static int __validate_configs_arch(void)
 	return 0;
 }
 #else
+/*
+ * Non-x86 reserved memory validation is not implemented yet.
+ */
 static int __validate_configs_arch(void)
 {
 	/* TODO: Validate architecture-specific configurations */
@@ -244,6 +369,12 @@ static int __validate_configs_arch(void)
 }
 #endif
 
+/*
+ * Validates module parameters before device initialization.
+ *
+ * This checks the reserved memory range, I/O unit configuration, and local
+ * read/write timing knobs. It does not map the backing store yet.
+ */
 static int __validate_configs(void)
 {
 	if (!memmap_start) {
@@ -275,10 +406,20 @@ static int __validate_configs(void)
 		NVMEV_ERROR("Need non-zero write time\n");
 		return -EINVAL;
 	}
+	if (!cpus) {
+		NVMEV_ERROR("[cpus] should specify one dispatcher CPU and at least one I/O worker CPU\n");
+		return -EINVAL;
+	}
 
 	return 0;
 }
 
+/*
+ * Prints local performance model settings when CONFIG_NVMEV_VERBOSE is set.
+ *
+ * These values still matter as fallback timing when MQSim IPC is disabled or
+ * unavailable.
+ */
 static void __print_perf_configs(void)
 {
 #ifdef CONFIG_NVMEV_VERBOSE
@@ -302,6 +443,11 @@ static void __print_perf_configs(void)
 #endif
 }
 
+/*
+ * Computes the number of pending entries for a doorbell index.
+ *
+ * Queue doorbells are ring-buffer positions, so wraparound must be handled.
+ */
 static int __get_nr_entries(int dbs_idx, int queue_size)
 {
 	int diff = nvmev_vdev->dbs[dbs_idx] - nvmev_vdev->old_dbs[dbs_idx];
@@ -311,6 +457,11 @@ static int __get_nr_entries(int dbs_idx, int queue_size)
 	return diff;
 }
 
+/*
+ * Read handler for procfs control/status files under /proc/nvmev/.
+ *
+ * Exposes local timing settings, I/O unit configuration, and queue statistics.
+ */
 static int __proc_file_read(struct seq_file *m, void *data)
 {
 	const char *filename = m->private;
@@ -357,6 +508,12 @@ static int __proc_file_read(struct seq_file *m, void *data)
 	return 0;
 }
 
+/*
+ * Write handler for procfs control files under /proc/nvmev/.
+ *
+ * Users can update selected local timing knobs at runtime. When MQSim IPC is
+ * enabled, daemon-provided timing overrides these values on the I/O path.
+ */
 static ssize_t __proc_file_write(struct file *file, const char __user *buf, size_t len,
 				 loff_t *offp)
 {
@@ -410,11 +567,20 @@ out:
 	return count;
 }
 
+/*
+ * procfs open handler shared by all NVMeVirt procfs files.
+ */
 static int __proc_file_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, __proc_file_read, (char *)file->f_path.dentry->d_name.name);
 }
 
+/*
+ * procfs file operations.
+ *
+ * Linux 5.0+ uses struct proc_ops, while older kernels use
+ * struct file_operations.
+ */
 #if LINUX_VERSION_CODE > KERNEL_VERSION(5, 0, 0)
 static const struct proc_ops proc_file_fops = {
 	.proc_open = __proc_file_open,
@@ -433,7 +599,13 @@ static const struct file_operations proc_file_fops = {
 };
 #endif
 
-static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
+/*
+ * Initializes the backing store and procfs control interface.
+ *
+ * memremap() maps the reserved physical DRAM range into kernel virtual address
+ * space. Namespaces later point into this mapped range as their backing store.
+ */
+static int NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	NVMEV_INFO("Storage: %#010lx-%#010lx (%lu MiB)\n",
 			nvmev_vdev->config.storage_start,
@@ -445,11 +617,41 @@ static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 
 	nvmev_vdev->storage_mapped = memremap(nvmev_vdev->config.storage_start,
 					      nvmev_vdev->config.storage_size, MEMREMAP_WB);
+	if (!nvmev_vdev->storage_mapped) {
+		NVMEV_ERROR("Failed to map storage memory as write-back; retrying write-through\n");
+		nvmev_vdev->storage_mapped = memremap(nvmev_vdev->config.storage_start,
+						      nvmev_vdev->config.storage_size, MEMREMAP_WT);
+	}
+	if (!nvmev_vdev->storage_mapped) {
+		NVMEV_ERROR("Failed to map storage memory as write-through; retrying write-combine\n");
+		nvmev_vdev->storage_mapped = memremap(nvmev_vdev->config.storage_start,
+						      nvmev_vdev->config.storage_size, MEMREMAP_WC);
+	}
+	if (!nvmev_vdev->storage_mapped) {
+		NVMEV_ERROR("Failed to map storage memory as write-combine; retrying uncached ioremap\n");
+		nvmev_vdev->storage_mapped = ioremap(nvmev_vdev->config.storage_start,
+						     nvmev_vdev->config.storage_size);
+		storage_mapped_with_ioremap = nvmev_vdev->storage_mapped != NULL;
+	}
 
-	if (nvmev_vdev->storage_mapped == NULL)
+	if (nvmev_vdev->storage_mapped == NULL) {
 		NVMEV_ERROR("Failed to map storage memory.\n");
+		kfree(nvmev_vdev->io_unit_stat);
+		nvmev_vdev->io_unit_stat = NULL;
+		return -ENOMEM;
+	}
 
 	nvmev_vdev->proc_root = proc_mkdir("nvmev", NULL);
+	if (!nvmev_vdev->proc_root) {
+		NVMEV_ERROR("Failed to create /proc/nvmev\n");
+		if (storage_mapped_with_ioremap)
+			iounmap(nvmev_vdev->storage_mapped);
+		else
+			memunmap(nvmev_vdev->storage_mapped);
+		nvmev_vdev->storage_mapped = NULL;
+		return -ENOMEM;
+	}
+
 	nvmev_vdev->proc_read_times =
 		proc_create("read_times", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_write_times =
@@ -458,8 +660,16 @@ static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 		proc_create("io_units", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_stat = proc_create("stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_debug = proc_create("debug", 0444, nvmev_vdev->proc_root, &proc_file_fops);
+
+	return 0;
 }
 
+/*
+ * Releases storage-related resources.
+ *
+ * This removes procfs files and unmaps the kernel virtual mapping created by
+ * memremap(). It does not erase the reserved physical memory contents.
+ */
 static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 {
 	remove_proc_entry("read_times", nvmev_vdev->proc_root);
@@ -470,13 +680,25 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 
 	remove_proc_entry("nvmev", NULL);
 
-	if (nvmev_vdev->storage_mapped)
-		memunmap(nvmev_vdev->storage_mapped);
+	if (nvmev_vdev->storage_mapped) {
+		if (storage_mapped_with_ioremap)
+			iounmap(nvmev_vdev->storage_mapped);
+		else
+			memunmap(nvmev_vdev->storage_mapped);
+	}
+	storage_mapped_with_ioremap = false;
 
 	if (nvmev_vdev->io_unit_stat)
 		kfree(nvmev_vdev->io_unit_stat);
 }
 
+/*
+ * Loads module parameters into nvmev_config.
+ *
+ * The first 1 MiB of the reserved range is kept for virtual device metadata;
+ * the remaining bytes become namespace backing storage. The cpus string is
+ * also split here into one dispatcher CPU and one or more I/O worker CPUs.
+ */
 static bool __load_configs(struct nvmev_config *config)
 {
 	bool first = true;
@@ -520,9 +742,21 @@ static bool __load_configs(struct nvmev_config *config)
 		first = false;
 	}
 
+	if (config->cpu_nr_dispatcher == -1 || config->nr_io_workers == 0) {
+		NVMEV_ERROR("[cpus] should specify one dispatcher CPU and at least one I/O worker CPU\n");
+		return false;
+	}
+
 	return true;
 }
 
+/*
+ * Creates NVMe namespaces and attaches each namespace to backing storage.
+ *
+ * NVMeVirt supports several namespace/device models: simple NVM, conventional
+ * SSD, ZNS, and KV SSD. Each init_namespace() implementation sets up
+ * ns[i].mapped, ns[i].size, and the namespace-specific proc_io_cmd() callback.
+ */
 static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	unsigned long long remaining_capacity = nvmev_vdev->config.storage_size;
@@ -561,6 +795,9 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 	nvmev_vdev->mdts = MDTS;
 }
 
+/*
+ * Removes namespaces and releases namespace-specific model state.
+ */
 static void NVMEV_NAMESPACE_FINAL(struct nvmev_dev *nvmev_vdev)
 {
 	struct nvmev_ns *ns = nvmev_vdev->ns;
@@ -584,6 +821,12 @@ static void NVMEV_NAMESPACE_FINAL(struct nvmev_dev *nvmev_vdev)
 	nvmev_vdev->ns = NULL;
 }
 
+/*
+ * Prints the base SSD type selected by Kbuild.
+ *
+ * Kbuild enables one CONFIG_NVMEVIRT_* target at a time and uses BASE_SSD to
+ * choose the device model compiled into this module.
+ */
 static void __print_base_config(void)
 {
 	const char *type = "unknown";
@@ -609,6 +852,21 @@ static void __print_base_config(void)
 			(NVMEV_VERSION & 0xff00) >> 8, (NVMEV_VERSION & 0x00ff), type);
 }
 
+/*
+ * Kernel module load entry point.
+ *
+ * The high-level initialization order is:
+ * 1. Print the selected base SSD type.
+ * 2. Allocate the nvmev_dev object.
+ * 3. Parse and validate module parameters.
+ * 4. Map reserved memory and initialize backing storage.
+ * 5. Create namespaces.
+ * 6. Initialize the MQSim IPC netlink endpoint.
+ * 7. Initialize the DMA engine if requested.
+ * 8. Create the virtual PCI/NVMe device.
+ * 9. Start I/O workers and the dispatcher.
+ * 10. Publish the virtual PCI bus/device to the Linux PCI core.
+ */
 static int NVMeV_init(void)
 {
 	int ret = 0;
@@ -623,9 +881,19 @@ static int NVMeV_init(void)
 		goto ret_err;
 	}
 
-	NVMEV_STORAGE_INIT(nvmev_vdev);
+	NVMEV_INFO("NVMeVirt-MQSim: mqsim_ipc_enable=%d memmap_start=%#lx memmap_size=%#lx\n",
+		   nvmev_mqsim_ipc_enabled() ? 1 : 0,
+		   nvmev_vdev->config.memmap_start, nvmev_vdev->config.memmap_size);
+
+	if (NVMEV_STORAGE_INIT(nvmev_vdev)) {
+		goto ret_err;
+	}
 
 	NVMEV_NAMESPACE_INIT(nvmev_vdev);
+
+	if (nvmev_mqsim_ipc_init()) {
+		goto ret_err;
+	}
 
 	if (io_using_dma) {
 		if (ioat_dma_chan_set("dma7chan0") != 0) {
@@ -650,10 +918,24 @@ static int NVMeV_init(void)
 	return 0;
 
 ret_err:
+	/*
+	 * Shared error cleanup path for initialization failures.
+	 *
+	 * This follows the existing NVMeVirt cleanup style. If more resources are
+	 * added to the init path later, this should be split into finer labels.
+	 */
+	nvmev_mqsim_ipc_exit();
 	VDEV_FINALIZE(nvmev_vdev);
 	return -EIO;
 }
 
+/*
+ * Kernel module unload entry point.
+ *
+ * The cleanup order is roughly the reverse of initialization: remove the
+ * virtual PCI device, stop kernel threads, remove namespaces and IPC, release
+ * storage mappings, and finally free queue/device structures.
+ */
 static void NVMeV_exit(void)
 {
 	int i;
@@ -667,6 +949,7 @@ static void NVMeV_exit(void)
 	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
 
 	NVMEV_NAMESPACE_FINAL(nvmev_vdev);
+	nvmev_mqsim_ipc_exit();
 	NVMEV_STORAGE_FINAL(nvmev_vdev);
 
 	if (io_using_dma) {
@@ -686,6 +969,12 @@ static void NVMeV_exit(void)
 	NVMEV_INFO("Virtual NVMe device closed\n");
 }
 
+/*
+ * Linux kernel module metadata.
+ *
+ * module_init/module_exit register load/unload entry points. MODULE_LICENSE()
+ * affects exported-symbol access and kernel taint state.
+ */
 MODULE_LICENSE("GPL v2");
 module_init(NVMeV_init);
 module_exit(NVMeV_exit);

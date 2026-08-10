@@ -8,6 +8,7 @@
 
 #include "nvmev.h"
 #include "dma.h"
+#include "mqsim_ipc.h"
 
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS))
 #include "ssd.h"
@@ -473,6 +474,19 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 
 	if (!ns->proc_io_cmd(ns, &req, &ret))
 		return false;
+
+	if (nvmev_mqsim_ipc_enabled()) {
+		u64 mqsim_latency_ns;
+		int mqsim_ret = nvmev_mqsim_query_latency(&req, &mqsim_latency_ns);
+
+		if (mqsim_ret == 0) {
+			ret.nsecs_target = nsecs_start + mqsim_latency_ns;
+		} else {
+			NVMEV_ERROR_RATELIMITED("MQSim IPC latency query failed (%d); using local timing model\n",
+						mqsim_ret);
+		}
+	}
+
 	*io_size = __cmd_io_size(&sq_entry(sq_entry).rw);
 
 #ifdef PERF_DEBUG
