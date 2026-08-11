@@ -2,6 +2,7 @@
 
 #include <linux/atomic.h>
 #include <linux/fs.h>
+#include <linux/hashtable.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -9,6 +10,8 @@
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
@@ -22,7 +25,7 @@ static unsigned int mqsim_ipc_timeout_us = 1000;
 module_param(mqsim_ipc_enable, bool, 0644);
 MODULE_PARM_DESC(mqsim_ipc_enable, "Enable NVMeVirt -> MQSim userspace timing IPC");
 module_param(mqsim_ipc_timeout_us, uint, 0644);
-MODULE_PARM_DESC(mqsim_ipc_timeout_us, "Timeout for one MQSim timing IPC request in usec");
+MODULE_PARM_DESC(mqsim_ipc_timeout_us, "Legacy MQSim IPC timeout parameter; async mode completes pending I/O on daemon disconnect");
 
 static struct nvmev_mqsim_shm *mqsim_shm;
 static struct proc_dir_entry *mqsim_proc_entry;
@@ -30,7 +33,6 @@ static bool mqsim_daemon_connected;
 
 static DEFINE_MUTEX(mqsim_request_lock);
 static DECLARE_WAIT_QUEUE_HEAD(mqsim_req_wq);
-static DECLARE_WAIT_QUEUE_HEAD(mqsim_reply_wq);
 static atomic64_t mqsim_next_request_id = ATOMIC64_INIT(1);
 static atomic64_t mqsim_requests = ATOMIC64_INIT(0);
 static atomic64_t mqsim_replies = ATOMIC64_INIT(0);
@@ -39,12 +41,22 @@ static atomic64_t mqsim_fallbacks = ATOMIC64_INIT(0);
 static atomic64_t mqsim_send_errors = ATOMIC64_INIT(0);
 static atomic64_t mqsim_req_ring_full = ATOMIC64_INIT(0);
 static atomic64_t mqsim_resp_ring_empty = ATOMIC64_INIT(0);
-
-static u64 mqsim_pending_request_id;
-static u64 mqsim_pending_latency_ns;
-static int mqsim_pending_status;
-static bool mqsim_pending_done;
+static atomic64_t mqsim_late_replies = ATOMIC64_INIT(0);
+static atomic64_t mqsim_pending_count = ATOMIC64_INIT(0);
+static atomic64_t mqsim_max_pending = ATOMIC64_INIT(0);
 static int mqsim_last_error;
+
+struct mqsim_pending_io {
+	struct hlist_node node;
+	u64 request_id;
+	u64 submit_time_ns;
+	u64 fallback_target_ns;
+	unsigned int worker_id;
+	unsigned int work_entry;
+};
+
+static DEFINE_HASHTABLE(mqsim_pending_table, 10);
+static DEFINE_SPINLOCK(mqsim_pending_lock);
 
 bool nvmev_mqsim_ipc_enabled(void)
 {
@@ -86,6 +98,18 @@ static int mqsim_push_request(const struct nvmev_mqsim_io_msg *msg)
 	return 0;
 }
 
+static void mqsim_update_max_pending(s64 pending)
+{
+	s64 old;
+
+	old = atomic64_read(&mqsim_max_pending);
+	while (pending > old) {
+		if (atomic64_cmpxchg(&mqsim_max_pending, old, pending) == old)
+			break;
+		old = atomic64_read(&mqsim_max_pending);
+	}
+}
+
 static void mqsim_consume_responses(void)
 {
 	struct nvmev_mqsim_ring_header *ring = &mqsim_shm->resp_ring;
@@ -102,14 +126,41 @@ static void mqsim_consume_responses(void)
 		    msg.type != NVMEV_MQSIM_MSG_IO_REPLY)
 			continue;
 
-		if (msg.request_id != mqsim_pending_request_id)
-			continue;
+		{
+			struct mqsim_pending_io *pending;
+			struct mqsim_pending_io *completed = NULL;
+			u64 target_ns;
 
-		mqsim_pending_latency_ns = msg.latency_ns;
-		mqsim_pending_status = msg.status;
-		mqsim_pending_done = true;
-		atomic64_inc(&mqsim_replies);
-		wake_up(&mqsim_reply_wq);
+			spin_lock(&mqsim_pending_lock);
+			hash_for_each_possible(mqsim_pending_table, pending, node, msg.request_id) {
+				if (pending->request_id != msg.request_id)
+					continue;
+
+				hash_del(&pending->node);
+				atomic64_dec(&mqsim_pending_count);
+				completed = pending;
+				break;
+			}
+			spin_unlock(&mqsim_pending_lock);
+
+			if (!completed) {
+				atomic64_inc(&mqsim_late_replies);
+				continue;
+			}
+
+			if (msg.status < 0) {
+				target_ns = completed->fallback_target_ns;
+				atomic64_inc(&mqsim_fallbacks);
+				mqsim_last_error = msg.status;
+			} else {
+				target_ns = completed->submit_time_ns + msg.latency_ns;
+				atomic64_inc(&mqsim_replies);
+			}
+
+			nvmev_mqsim_complete_io(completed->worker_id, completed->work_entry,
+						completed->request_id, target_ns);
+			kfree(completed);
+		}
 	}
 }
 
@@ -125,10 +176,25 @@ static int mqsim_dev_open(struct inode *inode, struct file *file)
 
 static int mqsim_dev_release(struct inode *inode, struct file *file)
 {
+	struct mqsim_pending_io *pending;
+	struct hlist_node *tmp;
+	int bucket;
+
 	mqsim_daemon_connected = false;
-	mqsim_pending_done = true;
-	mqsim_pending_status = -ENOTCONN;
-	wake_up(&mqsim_reply_wq);
+
+	spin_lock(&mqsim_pending_lock);
+	hash_for_each_safe(mqsim_pending_table, bucket, tmp, pending, node) {
+		hash_del(&pending->node);
+		atomic64_dec(&mqsim_pending_count);
+
+		atomic64_inc(&mqsim_fallbacks);
+		nvmev_mqsim_complete_io(pending->worker_id, pending->work_entry,
+					pending->request_id, pending->fallback_target_ns);
+		kfree(pending);
+	}
+	spin_unlock(&mqsim_pending_lock);
+
+	mqsim_last_error = -ENOTCONN;
 	NVMEV_INFO("MQSim shared-memory IPC daemon disconnected\n");
 	return 0;
 }
@@ -193,11 +259,14 @@ static int nvmev_mqsim_proc_read(struct seq_file *m, void *data)
 	seq_printf(m, "resp_tail: %u\n", READ_ONCE(mqsim_shm->resp_ring.tail));
 	seq_printf(m, "requests: %lld\n", atomic64_read(&mqsim_requests));
 	seq_printf(m, "replies: %lld\n", atomic64_read(&mqsim_replies));
+	seq_printf(m, "pending: %lld\n", atomic64_read(&mqsim_pending_count));
+	seq_printf(m, "max_pending: %lld\n", atomic64_read(&mqsim_max_pending));
 	seq_printf(m, "timeouts: %lld\n", atomic64_read(&mqsim_timeouts));
 	seq_printf(m, "fallbacks: %lld\n", atomic64_read(&mqsim_fallbacks));
 	seq_printf(m, "send_errors: %lld\n", atomic64_read(&mqsim_send_errors));
 	seq_printf(m, "req_ring_full: %lld\n", atomic64_read(&mqsim_req_ring_full));
 	seq_printf(m, "resp_ring_empty: %lld\n", atomic64_read(&mqsim_resp_ring_empty));
+	seq_printf(m, "late_replies: %lld\n", atomic64_read(&mqsim_late_replies));
 	seq_printf(m, "last_error: %d\n", mqsim_last_error);
 	return 0;
 }
@@ -241,6 +310,7 @@ int nvmev_mqsim_ipc_init(void)
 	if (!mqsim_shm)
 		return -ENOMEM;
 	nvmev_mqsim_shm_init();
+	hash_init(mqsim_pending_table);
 
 	ret = misc_register(&mqsim_miscdev);
 	if (ret) {
@@ -261,6 +331,10 @@ int nvmev_mqsim_ipc_init(void)
 
 void nvmev_mqsim_ipc_exit(void)
 {
+	struct mqsim_pending_io *pending;
+	struct hlist_node *tmp;
+	int bucket;
+
 	if (mqsim_proc_entry) {
 		remove_proc_entry("mqsim_ipc", nvmev_vdev->proc_root);
 		mqsim_proc_entry = NULL;
@@ -269,18 +343,30 @@ void nvmev_mqsim_ipc_exit(void)
 	misc_deregister(&mqsim_miscdev);
 	mqsim_daemon_connected = false;
 
+	spin_lock(&mqsim_pending_lock);
+	hash_for_each_safe(mqsim_pending_table, bucket, tmp, pending, node) {
+		hash_del(&pending->node);
+		atomic64_dec(&mqsim_pending_count);
+		nvmev_mqsim_complete_io(pending->worker_id, pending->work_entry,
+					pending->request_id, pending->fallback_target_ns);
+		kfree(pending);
+	}
+	spin_unlock(&mqsim_pending_lock);
+
 	if (mqsim_shm) {
 		vfree(mqsim_shm);
 		mqsim_shm = NULL;
 	}
 }
 
-int nvmev_mqsim_query_latency(struct nvmev_request *req, u64 *latency_ns)
+int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
+			     unsigned int work_entry, u64 fallback_target_ns,
+			     u64 *request_id)
 {
 	struct nvme_rw_command *rw = &req->cmd->rw;
 	struct nvmev_mqsim_io_msg msg = { 0 };
-	long timeout_jiffies;
-	long wait_ret;
+	struct mqsim_pending_io *pending;
+	s64 pending_now;
 	int ret;
 
 	if (!mqsim_ipc_enable)
@@ -289,18 +375,24 @@ int nvmev_mqsim_query_latency(struct nvmev_request *req, u64 *latency_ns)
 	if (rw->opcode != nvme_cmd_read && rw->opcode != nvme_cmd_write)
 		return -EOPNOTSUPP;
 
-	mutex_lock(&mqsim_request_lock);
-	atomic64_inc(&mqsim_requests);
+	pending = kzalloc(sizeof(*pending), GFP_KERNEL);
+	if (!pending)
+		return -ENOMEM;
 
-	mqsim_pending_request_id = atomic64_inc_return(&mqsim_next_request_id);
-	mqsim_pending_latency_ns = 0;
-	mqsim_pending_status = 0;
-	mqsim_pending_done = false;
+	mutex_lock(&mqsim_request_lock);
+
+	pending->request_id = atomic64_inc_return(&mqsim_next_request_id);
+	pending->submit_time_ns = req->nsecs_start;
+	pending->fallback_target_ns = fallback_target_ns;
+	pending->worker_id = worker_id;
+	pending->work_entry = work_entry;
+	if (request_id)
+		*request_id = pending->request_id;
 
 	msg.magic = NVMEV_MQSIM_MAGIC;
 	msg.version = NVMEV_MQSIM_VERSION;
 	msg.type = NVMEV_MQSIM_MSG_IO_REQUEST;
-	msg.request_id = mqsim_pending_request_id;
+	msg.request_id = pending->request_id;
 	msg.submit_time_ns = req->nsecs_start;
 	msg.opcode = rw->opcode == nvme_cmd_read ? NVMEV_MQSIM_IO_READ : NVMEV_MQSIM_IO_WRITE;
 	msg.nsid = rw->nsid;
@@ -309,35 +401,27 @@ int nvmev_mqsim_query_latency(struct nvmev_request *req, u64 *latency_ns)
 	msg.slba = rw->slba;
 	msg.nlb = rw->length + 1;
 
+	nvmev_mqsim_bind_io(worker_id, work_entry, pending->request_id);
+	spin_lock(&mqsim_pending_lock);
+	hash_add(mqsim_pending_table, &pending->node, pending->request_id);
+	pending_now = atomic64_inc_return(&mqsim_pending_count);
+	mqsim_update_max_pending(pending_now);
+	spin_unlock(&mqsim_pending_lock);
+
 	ret = mqsim_push_request(&msg);
 	if (ret < 0) {
+		spin_lock(&mqsim_pending_lock);
+		hash_del(&pending->node);
+		atomic64_dec(&mqsim_pending_count);
+		spin_unlock(&mqsim_pending_lock);
 		atomic64_inc(&mqsim_send_errors);
 		atomic64_inc(&mqsim_fallbacks);
 		mqsim_last_error = ret;
+		kfree(pending);
 		goto out_unlock;
 	}
 
-	timeout_jiffies = usecs_to_jiffies(mqsim_ipc_timeout_us);
-	if (timeout_jiffies <= 0)
-		timeout_jiffies = 1;
-
-	wait_ret = wait_event_timeout(mqsim_reply_wq, mqsim_pending_done, timeout_jiffies);
-	if (wait_ret == 0) {
-		ret = -ETIMEDOUT;
-		atomic64_inc(&mqsim_timeouts);
-		atomic64_inc(&mqsim_fallbacks);
-		mqsim_last_error = ret;
-		goto out_unlock;
-	}
-
-	if (mqsim_pending_status < 0) {
-		ret = mqsim_pending_status;
-		atomic64_inc(&mqsim_fallbacks);
-		mqsim_last_error = ret;
-		goto out_unlock;
-	}
-
-	*latency_ns = mqsim_pending_latency_ns;
+	atomic64_inc(&mqsim_requests);
 	ret = 0;
 
 out_unlock:

@@ -315,8 +315,9 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(int sqid, unsigned in
 	return worker;
 }
 
-static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long long nsecs_start,
-			     struct nvmev_result *ret)
+static bool __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long long nsecs_start,
+			     struct nvmev_result *ret, unsigned int *worker_id,
+			     unsigned int *work_entry)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	struct nvmev_io_worker *worker;
@@ -325,7 +326,7 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 
 	worker = __allocate_work_queue_entry(sqid, &entry);
 	if (!worker)
-		return;
+		return false;
 
 	w = worker->work_queue + entry;
 
@@ -344,6 +345,7 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 	w->status = ret->status;
 	w->result0 = (unsigned int)(ret->result & 0xFFFFFFFF);
 	w->result1 = (unsigned int)(ret->result >> 32);
+	w->mqsim_request_id = 0;
 	w->is_completed = false;
 	w->is_copied = false;
 	w->prev = -1;
@@ -353,6 +355,45 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 	mb(); /* IO worker shall see the updated w at once */
 
 	__insert_req_sorted(entry, worker, ret->nsecs_target);
+	if (worker_id)
+		*worker_id = worker->id;
+	if (work_entry)
+		*work_entry = entry;
+	return true;
+}
+
+void nvmev_mqsim_bind_io(unsigned int worker_id, unsigned int work_entry,
+			 uint64_t request_id)
+{
+	struct nvmev_io_worker *worker;
+	struct nvmev_io_work *w;
+
+	if (!nvmev_vdev || worker_id >= nvmev_vdev->config.nr_io_workers ||
+	    work_entry >= NR_MAX_PARALLEL_IO)
+		return;
+
+	worker = &nvmev_vdev->io_workers[worker_id];
+	w = &worker->work_queue[work_entry];
+	WRITE_ONCE(w->mqsim_request_id, request_id);
+}
+
+void nvmev_mqsim_complete_io(unsigned int worker_id, unsigned int work_entry,
+			     uint64_t request_id, unsigned long long nsecs_target)
+{
+	struct nvmev_io_worker *worker;
+	struct nvmev_io_work *w;
+
+	if (!nvmev_vdev || worker_id >= nvmev_vdev->config.nr_io_workers ||
+	    work_entry >= NR_MAX_PARALLEL_IO)
+		return;
+
+	worker = &nvmev_vdev->io_workers[worker_id];
+	w = &worker->work_queue[work_entry];
+	if (READ_ONCE(w->mqsim_request_id) != request_id || READ_ONCE(w->is_completed))
+		return;
+
+	WRITE_ONCE(w->nsecs_target, nsecs_target);
+	wake_up_process(worker->task_struct);
 }
 
 void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
@@ -375,6 +416,7 @@ void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 	w->sqid = sqid;
 	w->nsecs_start = w->nsecs_enqueue = local_clock();
 	w->nsecs_target = nsecs_target;
+	w->mqsim_request_id = 0;
 	w->is_completed = false;
 	w->is_copied = true;
 	w->prev = -1;
@@ -460,6 +502,10 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 		.nsecs_target = nsecs_start,
 		.status = NVME_SC_SUCCESS,
 	};
+	unsigned int mqsim_worker_id = 0;
+	unsigned int mqsim_work_entry = 0;
+	bool mqsim_async = false;
+	u64 local_target_ns;
 
 #ifdef PERF_DEBUG
 	unsigned long long prev_clock = local_clock();
@@ -475,16 +521,11 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	if (!ns->proc_io_cmd(ns, &req, &ret))
 		return false;
 
-	if (nvmev_mqsim_ipc_enabled()) {
-		u64 mqsim_latency_ns;
-		int mqsim_ret = nvmev_mqsim_query_latency(&req, &mqsim_latency_ns);
-
-		if (mqsim_ret == 0) {
-			ret.nsecs_target = nsecs_start + mqsim_latency_ns;
-		} else {
-			NVMEV_ERROR_RATELIMITED("MQSim IPC latency query failed (%d); using local timing model\n",
-						mqsim_ret);
-		}
+	local_target_ns = ret.nsecs_target;
+	if (nvmev_mqsim_ipc_enabled() &&
+	    (cmd->rw.opcode == nvme_cmd_read || cmd->rw.opcode == nvme_cmd_write)) {
+		mqsim_async = true;
+		ret.nsecs_target = U64_MAX;
 	}
 
 	*io_size = __cmd_io_size(&sq_entry(sq_entry).rw);
@@ -493,7 +534,24 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	prev_clock2 = local_clock();
 #endif
 
-	__enqueue_io_req(sqid, sq->cqid, sq_entry, nsecs_start, &ret);
+	if (!__enqueue_io_req(sqid, sq->cqid, sq_entry, nsecs_start, &ret,
+			      &mqsim_worker_id, &mqsim_work_entry))
+		return false;
+
+	if (mqsim_async) {
+		u64 mqsim_request_id = 0;
+		int mqsim_ret = nvmev_mqsim_submit_async(&req, mqsim_worker_id,
+							 mqsim_work_entry,
+							 local_target_ns,
+							 &mqsim_request_id);
+
+		if (mqsim_ret < 0) {
+			NVMEV_ERROR_RATELIMITED("MQSim IPC async submit failed (%d); using local timing model\n",
+						mqsim_ret);
+			nvmev_mqsim_complete_io(mqsim_worker_id, mqsim_work_entry,
+						mqsim_request_id, local_target_ns);
+		}
+	}
 
 #ifdef PERF_DEBUG
 	prev_clock3 = local_clock();
