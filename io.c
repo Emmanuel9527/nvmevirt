@@ -5,6 +5,7 @@
 #include <linux/ktime.h>
 #include <linux/highmem.h>
 #include <linux/sched/clock.h>
+#include <linux/err.h>
 
 #include "nvmev.h"
 #include "dma.h"
@@ -809,12 +810,15 @@ static int nvmev_io_worker(void *data)
 	return 0;
 }
 
-void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
+int NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	unsigned int i, worker_id;
+	int ret = -ENOMEM;
 
 	nvmev_vdev->io_workers =
 		kcalloc(nvmev_vdev->config.nr_io_workers, sizeof(struct nvmev_io_worker), GFP_KERNEL);
+	if (!nvmev_vdev->io_workers)
+		return -ENOMEM;
 	nvmev_vdev->io_worker_turn = 0;
 
 	for (worker_id = 0; worker_id < nvmev_vdev->config.nr_io_workers; worker_id++) {
@@ -822,6 +826,10 @@ void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 
 		worker->work_queue =
 			kzalloc(sizeof(struct nvmev_io_work) * NR_MAX_PARALLEL_IO, GFP_KERNEL);
+		if (!worker->work_queue) {
+			NVMEV_ERROR("Failed to allocate I/O worker %u queue\n", worker_id);
+			goto err_cleanup;
+		}
 		for (i = 0; i < NR_MAX_PARALLEL_IO; i++) {
 			worker->work_queue[i].next = i + 1;
 			worker->work_queue[i].prev = i - 1;
@@ -836,25 +844,43 @@ void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 		snprintf(worker->thread_name, sizeof(worker->thread_name), "nvmev_io_worker_%d", worker_id);
 
 		worker->task_struct = kthread_create(nvmev_io_worker, worker, "%s", worker->thread_name);
+		if (IS_ERR(worker->task_struct)) {
+			ret = PTR_ERR(worker->task_struct);
+			worker->task_struct = NULL;
+			NVMEV_ERROR("Failed to create I/O worker %u thread: %d\n", worker_id, ret);
+			goto err_cleanup;
+		}
 
 		kthread_bind(worker->task_struct, nvmev_vdev->config.cpu_nr_io_workers[worker_id]);
 		wake_up_process(worker->task_struct);
 	}
+
+	return 0;
+
+err_cleanup:
+	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
+	return ret;
 }
 
 void NVMEV_IO_WORKER_FINAL(struct nvmev_dev *nvmev_vdev)
 {
 	unsigned int i;
 
+	if (!nvmev_vdev || !nvmev_vdev->io_workers)
+		return;
+
 	for (i = 0; i < nvmev_vdev->config.nr_io_workers; i++) {
 		struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[i];
 
 		if (!IS_ERR_OR_NULL(worker->task_struct)) {
 			kthread_stop(worker->task_struct);
+			worker->task_struct = NULL;
 		}
 
 		kfree(worker->work_queue);
+		worker->work_queue = NULL;
 	}
 
 	kfree(nvmev_vdev->io_workers);
+	nvmev_vdev->io_workers = NULL;
 }

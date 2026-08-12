@@ -321,7 +321,7 @@ void nvmev_mqsim_bind_io(unsigned int worker_id, unsigned int work_entry,
 			 uint64_t request_id);
 void nvmev_mqsim_complete_io(unsigned int worker_id, unsigned int work_entry,
 			     uint64_t request_id, unsigned long long nsecs_target);
-void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev);
+int NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev);
 void NVMEV_IO_WORKER_FINAL(struct nvmev_dev *nvmev_vdev);
 int nvmev_proc_io_sq(int qid, int new_db, int old_db);
 void nvmev_proc_io_cq(int qid, int new_db, int old_db);

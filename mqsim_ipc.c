@@ -30,6 +30,7 @@ MODULE_PARM_DESC(mqsim_ipc_timeout_us, "Legacy MQSim IPC timeout parameter; asyn
 static struct nvmev_mqsim_shm *mqsim_shm;
 static struct proc_dir_entry *mqsim_proc_entry;
 static bool mqsim_daemon_connected;
+static bool mqsim_misc_registered;
 
 static DEFINE_MUTEX(mqsim_request_lock);
 static DECLARE_WAIT_QUEUE_HEAD(mqsim_req_wq);
@@ -318,6 +319,7 @@ int nvmev_mqsim_ipc_init(void)
 		mqsim_shm = NULL;
 		return ret;
 	}
+	mqsim_misc_registered = true;
 
 	NVMEV_INFO("MQSim shared-memory IPC initialized at /dev/%s, enabled=%d\n",
 		   NVMEV_MQSIM_DEVICE_NAME, mqsim_ipc_enable);
@@ -335,12 +337,15 @@ void nvmev_mqsim_ipc_exit(void)
 	struct hlist_node *tmp;
 	int bucket;
 
-	if (mqsim_proc_entry) {
+	if (mqsim_proc_entry && nvmev_vdev && nvmev_vdev->proc_root) {
 		remove_proc_entry("mqsim_ipc", nvmev_vdev->proc_root);
 		mqsim_proc_entry = NULL;
 	}
 
-	misc_deregister(&mqsim_miscdev);
+	if (mqsim_misc_registered) {
+		misc_deregister(&mqsim_miscdev);
+		mqsim_misc_registered = false;
+	}
 	mqsim_daemon_connected = false;
 
 	spin_lock(&mqsim_pending_lock);

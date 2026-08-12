@@ -434,8 +434,14 @@ struct nvmev_dev *VDEV_INIT(void)
 {
 	struct nvmev_dev *nvmev_vdev;
 	nvmev_vdev = kzalloc(sizeof(*nvmev_vdev), GFP_KERNEL);
+	if (!nvmev_vdev)
+		return NULL;
 
 	nvmev_vdev->virtDev = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!nvmev_vdev->virtDev) {
+		kfree(nvmev_vdev);
+		return NULL;
+	}
 
 	nvmev_vdev->pcihdr = nvmev_vdev->virtDev + OFFS_PCI_HDR;
 	nvmev_vdev->pmcap = nvmev_vdev->virtDev + OFFS_PCI_PM_CAP;
@@ -450,6 +456,9 @@ struct nvmev_dev *VDEV_INIT(void)
 
 void VDEV_FINALIZE(struct nvmev_dev *nvmev_vdev)
 {
+	if (!nvmev_vdev)
+		return;
+
 	if (nvmev_vdev->msix_table)
 		memunmap(nvmev_vdev->msix_table);
 
@@ -475,8 +484,7 @@ void VDEV_FINALIZE(struct nvmev_dev *nvmev_vdev)
 	if (nvmev_vdev->virtDev)
 		kfree(nvmev_vdev->virtDev);
 
-	if (nvmev_vdev)
-		kfree(nvmev_vdev);
+	kfree(nvmev_vdev);
 }
 
 static void PCI_HEADER_SETTINGS(struct pci_header *pcihdr, unsigned long base_pa)

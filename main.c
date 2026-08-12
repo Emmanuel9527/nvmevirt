@@ -11,6 +11,8 @@
 #include <linux/io.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/cpumask.h>
+#include <linux/err.h>
 
 #ifdef CONFIG_X86
 #include <asm/e820/types.h>
@@ -300,12 +302,24 @@ static int nvmev_dispatcher(void *data)
  * If CPU binding is configured, the dispatcher is bound to the first CPU in
  * the cpus parameter to reduce scheduling noise.
  */
-static void NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
+static int NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
 {
-	nvmev_vdev->nvmev_dispatcher = kthread_create(nvmev_dispatcher, NULL, "nvmev_dispatcher");
+	struct task_struct *task;
+
+	task = kthread_create(nvmev_dispatcher, NULL, "nvmev_dispatcher");
+	if (IS_ERR(task)) {
+		int ret = PTR_ERR(task);
+
+		nvmev_vdev->nvmev_dispatcher = NULL;
+		NVMEV_ERROR("Failed to create dispatcher thread: %d\n", ret);
+		return ret;
+	}
+
+	nvmev_vdev->nvmev_dispatcher = task;
 	if (nvmev_vdev->config.cpu_nr_dispatcher != -1)
-		kthread_bind(nvmev_vdev->nvmev_dispatcher, nvmev_vdev->config.cpu_nr_dispatcher);
-	wake_up_process(nvmev_vdev->nvmev_dispatcher);
+		kthread_bind(task, nvmev_vdev->config.cpu_nr_dispatcher);
+	wake_up_process(task);
+	return 0;
 }
 
 /*
@@ -599,6 +613,8 @@ static const struct file_operations proc_file_fops = {
 };
 #endif
 
+static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev);
+
 /*
  * Initializes the backing store and procfs control interface.
  *
@@ -614,6 +630,8 @@ static int NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 
 	nvmev_vdev->io_unit_stat = kzalloc(
 		sizeof(*nvmev_vdev->io_unit_stat) * nvmev_vdev->config.nr_io_units, GFP_KERNEL);
+	if (!nvmev_vdev->io_unit_stat)
+		return -ENOMEM;
 
 	nvmev_vdev->storage_mapped = memremap(nvmev_vdev->config.storage_start,
 					      nvmev_vdev->config.storage_size, MEMREMAP_WB);
@@ -644,11 +662,7 @@ static int NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 	nvmev_vdev->proc_root = proc_mkdir("nvmev", NULL);
 	if (!nvmev_vdev->proc_root) {
 		NVMEV_ERROR("Failed to create /proc/nvmev\n");
-		if (storage_mapped_with_ioremap)
-			iounmap(nvmev_vdev->storage_mapped);
-		else
-			memunmap(nvmev_vdev->storage_mapped);
-		nvmev_vdev->storage_mapped = NULL;
+		NVMEV_STORAGE_FINAL(nvmev_vdev);
 		return -ENOMEM;
 	}
 
@@ -660,6 +674,13 @@ static int NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 		proc_create("io_units", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_stat = proc_create("stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_debug = proc_create("debug", 0444, nvmev_vdev->proc_root, &proc_file_fops);
+	if (!nvmev_vdev->proc_read_times || !nvmev_vdev->proc_write_times ||
+	    !nvmev_vdev->proc_io_units || !nvmev_vdev->proc_stat ||
+	    !nvmev_vdev->proc_debug) {
+		NVMEV_ERROR("Failed to create one or more /proc/nvmev entries\n");
+		NVMEV_STORAGE_FINAL(nvmev_vdev);
+		return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -672,13 +693,33 @@ static int NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
  */
 static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 {
-	remove_proc_entry("read_times", nvmev_vdev->proc_root);
-	remove_proc_entry("write_times", nvmev_vdev->proc_root);
-	remove_proc_entry("io_units", nvmev_vdev->proc_root);
-	remove_proc_entry("stat", nvmev_vdev->proc_root);
-	remove_proc_entry("debug", nvmev_vdev->proc_root);
+	if (!nvmev_vdev)
+		return;
 
-	remove_proc_entry("nvmev", NULL);
+	if (nvmev_vdev->proc_root) {
+		if (nvmev_vdev->proc_read_times) {
+			remove_proc_entry("read_times", nvmev_vdev->proc_root);
+			nvmev_vdev->proc_read_times = NULL;
+		}
+		if (nvmev_vdev->proc_write_times) {
+			remove_proc_entry("write_times", nvmev_vdev->proc_root);
+			nvmev_vdev->proc_write_times = NULL;
+		}
+		if (nvmev_vdev->proc_io_units) {
+			remove_proc_entry("io_units", nvmev_vdev->proc_root);
+			nvmev_vdev->proc_io_units = NULL;
+		}
+		if (nvmev_vdev->proc_stat) {
+			remove_proc_entry("stat", nvmev_vdev->proc_root);
+			nvmev_vdev->proc_stat = NULL;
+		}
+		if (nvmev_vdev->proc_debug) {
+			remove_proc_entry("debug", nvmev_vdev->proc_root);
+			nvmev_vdev->proc_debug = NULL;
+		}
+		remove_proc_entry("nvmev", NULL);
+		nvmev_vdev->proc_root = NULL;
+	}
 
 	if (nvmev_vdev->storage_mapped) {
 		if (storage_mapped_with_ioremap)
@@ -686,10 +727,13 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 		else
 			memunmap(nvmev_vdev->storage_mapped);
 	}
+	nvmev_vdev->storage_mapped = NULL;
 	storage_mapped_with_ioremap = false;
 
-	if (nvmev_vdev->io_unit_stat)
+	if (nvmev_vdev->io_unit_stat) {
 		kfree(nvmev_vdev->io_unit_stat);
+		nvmev_vdev->io_unit_stat = NULL;
+	}
 }
 
 /*
@@ -732,10 +776,31 @@ static bool __load_configs(struct nvmev_config *config)
 	config->cpu_nr_dispatcher = -1;
 
 	while ((cpu = strsep(&cpus, ",")) != NULL) {
-		cpu_nr = (unsigned int)simple_strtol(cpu, NULL, 10);
+		int parse_ret;
+
+		if (!*cpu) {
+			NVMEV_ERROR("[cpus] contains an empty CPU entry\n");
+			return false;
+		}
+
+		parse_ret = kstrtouint(cpu, 10, &cpu_nr);
+		if (parse_ret) {
+			NVMEV_ERROR("[cpus] invalid CPU entry: %s\n", cpu);
+			return false;
+		}
+		if (cpu_nr >= nr_cpu_ids || !cpu_possible(cpu_nr)) {
+			NVMEV_ERROR("[cpus] CPU %u is not possible on this system\n", cpu_nr);
+			return false;
+		}
+
 		if (first) {
 			config->cpu_nr_dispatcher = cpu_nr;
 		} else {
+			if (config->nr_io_workers >= ARRAY_SIZE(config->cpu_nr_io_workers)) {
+				NVMEV_ERROR("[cpus] too many I/O worker CPUs; max=%zu\n",
+					    ARRAY_SIZE(config->cpu_nr_io_workers));
+				return false;
+			}
 			config->cpu_nr_io_workers[config->nr_io_workers] = cpu_nr;
 			config->nr_io_workers++;
 		}
@@ -757,7 +822,7 @@ static bool __load_configs(struct nvmev_config *config)
  * SSD, ZNS, and KV SSD. Each init_namespace() implementation sets up
  * ns[i].mapped, ns[i].size, and the namespace-specific proc_io_cmd() callback.
  */
-static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
+static int NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	unsigned long long remaining_capacity = nvmev_vdev->config.storage_size;
 	void *ns_addr = nvmev_vdev->storage_mapped;
@@ -767,6 +832,8 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 	unsigned long long size;
 
 	struct nvmev_ns *ns = kmalloc(sizeof(struct nvmev_ns) * nr_ns, GFP_KERNEL);
+	if (!ns)
+		return -ENOMEM;
 
 	for (i = 0; i < nr_ns; i++) {
 		if (NS_CAPACITY(i) == 0)
@@ -793,6 +860,7 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 	nvmev_vdev->ns = ns;
 	nvmev_vdev->nr_ns = nr_ns;
 	nvmev_vdev->mdts = MDTS;
+	return 0;
 }
 
 /*
@@ -803,6 +871,9 @@ static void NVMEV_NAMESPACE_FINAL(struct nvmev_dev *nvmev_vdev)
 	struct nvmev_ns *ns = nvmev_vdev->ns;
 	const int nr_ns = NR_NAMESPACES; // XXX: allow for dynamic nvmev_vdev->nr_ns
 	int i;
+
+	if (!ns)
+		return;
 
 	for (i = 0; i < nr_ns; i++) {
 		if (NS_SSD_TYPE(i) == SSD_TYPE_NVM)
@@ -819,6 +890,7 @@ static void NVMEV_NAMESPACE_FINAL(struct nvmev_dev *nvmev_vdev)
 
 	kfree(ns);
 	nvmev_vdev->ns = NULL;
+	nvmev_vdev->nr_ns = 0;
 }
 
 /*
@@ -852,6 +924,15 @@ static void __print_base_config(void)
 			(NVMEV_VERSION & 0xff00) >> 8, (NVMEV_VERSION & 0x00ff), type);
 }
 
+static void NVMEV_PCI_FINAL(struct nvmev_dev *nvmev_vdev)
+{
+	if (nvmev_vdev && nvmev_vdev->virt_bus != NULL) {
+		pci_stop_root_bus(nvmev_vdev->virt_bus);
+		pci_remove_root_bus(nvmev_vdev->virt_bus);
+		nvmev_vdev->virt_bus = NULL;
+	}
+}
+
 /*
  * Kernel module load entry point.
  *
@@ -878,22 +959,25 @@ static int NVMeV_init(void)
 		return -EINVAL;
 
 	if (!__load_configs(&nvmev_vdev->config)) {
-		goto ret_err;
+		ret = -EINVAL;
+		goto err_vdev;
 	}
 
 	NVMEV_INFO("NVMeVirt-MQSim: mqsim_ipc_enable=%d memmap_start=%#lx memmap_size=%#lx\n",
 		   nvmev_mqsim_ipc_enabled() ? 1 : 0,
 		   nvmev_vdev->config.memmap_start, nvmev_vdev->config.memmap_size);
 
-	if (NVMEV_STORAGE_INIT(nvmev_vdev)) {
-		goto ret_err;
-	}
+	ret = NVMEV_STORAGE_INIT(nvmev_vdev);
+	if (ret)
+		goto err_vdev;
 
-	NVMEV_NAMESPACE_INIT(nvmev_vdev);
+	ret = NVMEV_NAMESPACE_INIT(nvmev_vdev);
+	if (ret)
+		goto err_storage;
 
-	if (nvmev_mqsim_ipc_init()) {
-		goto ret_err;
-	}
+	ret = nvmev_mqsim_ipc_init();
+	if (ret)
+		goto err_namespace;
 
 	if (io_using_dma) {
 		if (ioat_dma_chan_set("dma7chan0") != 0) {
@@ -903,13 +987,19 @@ static int NVMeV_init(void)
 	}
 
 	if (!NVMEV_PCI_INIT(nvmev_vdev)) {
-		goto ret_err;
+		ret = -EIO;
+		goto err_pci;
 	}
 
 	__print_perf_configs();
 
-	NVMEV_IO_WORKER_INIT(nvmev_vdev);
-	NVMEV_DISPATCHER_INIT(nvmev_vdev);
+	ret = NVMEV_IO_WORKER_INIT(nvmev_vdev);
+	if (ret)
+		goto err_pci;
+
+	ret = NVMEV_DISPATCHER_INIT(nvmev_vdev);
+	if (ret)
+		goto err_workers;
 
 	pci_bus_add_devices(nvmev_vdev->virt_bus);
 
@@ -917,16 +1007,19 @@ static int NVMeV_init(void)
 
 	return 0;
 
-ret_err:
-	/*
-	 * Shared error cleanup path for initialization failures.
-	 *
-	 * This follows the existing NVMeVirt cleanup style. If more resources are
-	 * added to the init path later, this should be split into finer labels.
-	 */
+err_workers:
+	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
+err_pci:
+	NVMEV_PCI_FINAL(nvmev_vdev);
 	nvmev_mqsim_ipc_exit();
+err_namespace:
+	NVMEV_NAMESPACE_FINAL(nvmev_vdev);
+err_storage:
+	NVMEV_STORAGE_FINAL(nvmev_vdev);
+err_vdev:
 	VDEV_FINALIZE(nvmev_vdev);
-	return -EIO;
+	nvmev_vdev = NULL;
+	return ret;
 }
 
 /*
@@ -940,16 +1033,13 @@ static void NVMeV_exit(void)
 {
 	int i;
 
-	if (nvmev_vdev->virt_bus != NULL) {
-		pci_stop_root_bus(nvmev_vdev->virt_bus);
-		pci_remove_root_bus(nvmev_vdev->virt_bus);
-	}
+	NVMEV_PCI_FINAL(nvmev_vdev);
 
 	NVMEV_DISPATCHER_FINAL(nvmev_vdev);
-	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
 
-	NVMEV_NAMESPACE_FINAL(nvmev_vdev);
 	nvmev_mqsim_ipc_exit();
+	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
+	NVMEV_NAMESPACE_FINAL(nvmev_vdev);
 	NVMEV_STORAGE_FINAL(nvmev_vdev);
 
 	if (io_using_dma) {
