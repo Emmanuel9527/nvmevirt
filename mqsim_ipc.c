@@ -11,6 +11,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/sched/clock.h>
 #include <linux/spinlock.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
@@ -32,7 +33,14 @@ static struct proc_dir_entry *mqsim_proc_entry;
 static bool mqsim_daemon_connected;
 static bool mqsim_misc_registered;
 
+/*
+ * The request ring has a single kernel-side producer: NVMeVirt.  Serialize
+ * request_id allocation, pending-table insertion, and req_ring publishing so
+ * the daemon sees a coherent stream of requests.
+ */
 static DEFINE_MUTEX(mqsim_request_lock);
+
+/* Daemon poll() sleeps on this wait queue until a new request is published. */
 static DECLARE_WAIT_QUEUE_HEAD(mqsim_req_wq);
 static atomic64_t mqsim_next_request_id = ATOMIC64_INIT(1);
 static atomic64_t mqsim_requests = ATOMIC64_INIT(0);
@@ -45,17 +53,35 @@ static atomic64_t mqsim_resp_ring_empty = ATOMIC64_INIT(0);
 static atomic64_t mqsim_late_replies = ATOMIC64_INIT(0);
 static atomic64_t mqsim_pending_count = ATOMIC64_INIT(0);
 static atomic64_t mqsim_max_pending = ATOMIC64_INIT(0);
+static atomic64_t mqsim_submit_cost_count = ATOMIC64_INIT(0);
+static atomic64_t mqsim_submit_cost_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_submit_cost_max_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_roundtrip_count = ATOMIC64_INIT(0);
+static atomic64_t mqsim_roundtrip_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_roundtrip_max_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_reply_late_count = ATOMIC64_INIT(0);
+static atomic64_t mqsim_reply_late_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_reply_late_max_ns = ATOMIC64_INIT(0);
 static int mqsim_last_error;
 
 struct mqsim_pending_io {
 	struct hlist_node node;
 	u64 request_id;
 	u64 submit_time_ns;
+	u64 ipc_submit_wall_ns;
 	u64 fallback_target_ns;
 	unsigned int worker_id;
 	unsigned int work_entry;
 };
 
+/*
+ * Outstanding I/O table.
+ *
+ * Each entry represents one NVMe request that has been sent to MQSim but has
+ * not received a simulated completion yet.  The key is request_id, not LBA.
+ * DEFINE_HASHTABLE(..., 10) creates 2^10 buckets; collisions are chained by
+ * the hlist_node embedded in struct mqsim_pending_io.
+ */
 static DEFINE_HASHTABLE(mqsim_pending_table, 10);
 static DEFINE_SPINLOCK(mqsim_pending_lock);
 
@@ -77,6 +103,25 @@ static inline bool ring_empty(const struct nvmev_mqsim_ring_header *ring)
 	return READ_ONCE(ring->head) == READ_ONCE(ring->tail);
 }
 
+static u64 mqsim_now_ns(void)
+{
+	if (nvmev_vdev)
+		return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
+	return local_clock();
+}
+
+static void mqsim_update_max(atomic64_t *counter, s64 value)
+{
+	s64 old;
+
+	old = atomic64_read(counter);
+	while (value > old) {
+		if (atomic64_cmpxchg(counter, old, value) == old)
+			break;
+		old = atomic64_read(counter);
+	}
+}
+
 static int mqsim_push_request(const struct nvmev_mqsim_io_msg *msg)
 {
 	struct nvmev_mqsim_ring_header *ring = &mqsim_shm->req_ring;
@@ -93,32 +138,74 @@ static int mqsim_push_request(const struct nvmev_mqsim_io_msg *msg)
 
 	tail = READ_ONCE(ring->tail);
 	memcpy(&mqsim_shm->req_entries[tail & NVMEV_MQSIM_RING_MASK], msg, sizeof(*msg));
+	/* Publish the entry contents before advancing tail for the daemon. */
 	smp_wmb();
 	WRITE_ONCE(ring->tail, tail + 1);
+
+	/* Wake the userspace daemon if it is blocked in poll(). */
 	wake_up_interruptible(&mqsim_req_wq);
 	return 0;
 }
 
+/* Record the largest number of simultaneously outstanding MQSim requests. */
 static void mqsim_update_max_pending(s64 pending)
 {
-	s64 old;
+	mqsim_update_max(&mqsim_max_pending, pending);
+}
 
-	old = atomic64_read(&mqsim_max_pending);
-	while (pending > old) {
-		if (atomic64_cmpxchg(&mqsim_max_pending, old, pending) == old)
-			break;
-		old = atomic64_read(&mqsim_max_pending);
-	}
+static s64 mqsim_avg_or_zero(atomic64_t *total, s64 count)
+{
+	return count ? atomic64_read(total) / count : 0;
+}
+
+static void mqsim_print_timing_stats(const char *reason)
+{
+	s64 submit_count = atomic64_read(&mqsim_submit_cost_count);
+	s64 roundtrip_count = atomic64_read(&mqsim_roundtrip_count);
+	s64 late_count = atomic64_read(&mqsim_reply_late_count);
+
+	NVMEV_INFO("MQSim IPC timing summary (%s): requests=%lld replies=%lld pending=%lld max_pending=%lld fallbacks=%lld send_errors=%lld req_ring_full=%lld late_replies=%lld\n",
+		   reason,
+		   atomic64_read(&mqsim_requests),
+		   atomic64_read(&mqsim_replies),
+		   atomic64_read(&mqsim_pending_count),
+		   atomic64_read(&mqsim_max_pending),
+		   atomic64_read(&mqsim_fallbacks),
+		   atomic64_read(&mqsim_send_errors),
+		   atomic64_read(&mqsim_req_ring_full),
+		   atomic64_read(&mqsim_late_replies));
+	NVMEV_INFO("MQSim IPC timing summary (%s): submit_count=%lld submit_avg_ns=%lld submit_max_ns=%lld roundtrip_count=%lld roundtrip_avg_ns=%lld roundtrip_max_ns=%lld\n",
+		   reason,
+		   submit_count,
+		   mqsim_avg_or_zero(&mqsim_submit_cost_total_ns, submit_count),
+		   atomic64_read(&mqsim_submit_cost_max_ns),
+		   roundtrip_count,
+		   mqsim_avg_or_zero(&mqsim_roundtrip_total_ns, roundtrip_count),
+		   atomic64_read(&mqsim_roundtrip_max_ns));
+	NVMEV_INFO("MQSim IPC timing summary (%s): reply_late_count=%lld reply_late_avg_ns=%lld reply_late_max_ns=%lld\n",
+		   reason,
+		   late_count,
+		   mqsim_avg_or_zero(&mqsim_reply_late_total_ns, late_count),
+		   atomic64_read(&mqsim_reply_late_max_ns));
 }
 
 static void mqsim_consume_responses(void)
 {
 	struct nvmev_mqsim_ring_header *ring = &mqsim_shm->resp_ring;
 
+	/*
+	 * Response-ring consumer.
+	 *
+	 * The daemon writes completions into resp_ring and then calls ioctl().
+	 * This function drains those completions, matches each request_id against
+	 * the pending table, and completes the original NVMeVirt I/O at the
+	 * simulated target time.
+	 */
 	while (!ring_empty(ring)) {
 		struct nvmev_mqsim_io_msg msg;
 		u32 head = READ_ONCE(ring->head);
 
+		/* Read the published completion after observing the ring head. */
 		smp_rmb();
 		memcpy(&msg, &mqsim_shm->resp_entries[head & NVMEV_MQSIM_RING_MASK], sizeof(msg));
 		WRITE_ONCE(ring->head, head + 1);
@@ -145,17 +232,37 @@ static void mqsim_consume_responses(void)
 			spin_unlock(&mqsim_pending_lock);
 
 			if (!completed) {
+				/* The request was already removed, usually due to disconnect fallback. */
 				atomic64_inc(&mqsim_late_replies);
 				continue;
 			}
 
 			if (msg.status < 0) {
+				/* MQSim reported an error; fall back to NVMeVirt's local timing. */
 				target_ns = completed->fallback_target_ns;
 				atomic64_inc(&mqsim_fallbacks);
 				mqsim_last_error = msg.status;
 			} else {
+				/* Convert MQSim latency into NVMeVirt's absolute completion time. */
 				target_ns = completed->submit_time_ns + msg.latency_ns;
 				atomic64_inc(&mqsim_replies);
+			}
+
+			if (msg.status >= 0) {
+				u64 now_ns = mqsim_now_ns();
+				u64 roundtrip_ns = now_ns - completed->ipc_submit_wall_ns;
+
+				atomic64_inc(&mqsim_roundtrip_count);
+				atomic64_add(roundtrip_ns, &mqsim_roundtrip_total_ns);
+				mqsim_update_max(&mqsim_roundtrip_max_ns, roundtrip_ns);
+
+				if (now_ns > target_ns) {
+					u64 late_ns = now_ns - target_ns;
+
+					atomic64_inc(&mqsim_reply_late_count);
+					atomic64_add(late_ns, &mqsim_reply_late_total_ns);
+					mqsim_update_max(&mqsim_reply_late_max_ns, late_ns);
+				}
 			}
 
 			nvmev_mqsim_complete_io(completed->worker_id, completed->work_entry,
@@ -167,6 +274,7 @@ static void mqsim_consume_responses(void)
 
 static int mqsim_dev_open(struct inode *inode, struct file *file)
 {
+	/* Only one MQSim daemon may own the IPC device at a time. */
 	if (mqsim_daemon_connected)
 		return -EBUSY;
 
@@ -183,6 +291,10 @@ static int mqsim_dev_release(struct inode *inode, struct file *file)
 
 	mqsim_daemon_connected = false;
 
+	/*
+	 * If the daemon exits while requests are outstanding, complete them with
+	 * fallback timing so user I/O does not hang forever.
+	 */
 	spin_lock(&mqsim_pending_lock);
 	hash_for_each_safe(mqsim_pending_table, bucket, tmp, pending, node) {
 		hash_del(&pending->node);
@@ -196,6 +308,7 @@ static int mqsim_dev_release(struct inode *inode, struct file *file)
 	spin_unlock(&mqsim_pending_lock);
 
 	mqsim_last_error = -ENOTCONN;
+	mqsim_print_timing_stats("daemon_disconnect");
 	NVMEV_INFO("MQSim shared-memory IPC daemon disconnected\n");
 	return 0;
 }
@@ -207,6 +320,7 @@ static int mqsim_dev_mmap(struct file *file, struct vm_area_struct *vma)
 	if (size > PAGE_ALIGN(sizeof(*mqsim_shm)))
 		return -EINVAL;
 
+	/* Expose the shared request/response rings to the userspace daemon. */
 	return remap_vmalloc_range(vma, mqsim_shm, 0);
 }
 
@@ -214,6 +328,10 @@ static __poll_t mqsim_dev_poll(struct file *file, poll_table *wait)
 {
 	__poll_t mask = 0;
 
+	/*
+	 * Let the daemon sleep until NVMeVirt publishes at least one request in
+	 * req_ring and calls wake_up_interruptible().
+	 */
 	poll_wait(file, &mqsim_req_wq, wait);
 	if (!ring_empty(&mqsim_shm->req_ring))
 		mask |= EPOLLIN | EPOLLRDNORM;
@@ -224,6 +342,7 @@ static long mqsim_dev_ioctl(struct file *file, unsigned int cmd, unsigned long a
 {
 	switch (cmd) {
 	case NVMEV_MQSIM_IOCTL_NOTIFY_RESP:
+		/* The daemon has published completions in resp_ring. Drain them. */
 		mqsim_consume_responses();
 		return 0;
 	default:
@@ -240,6 +359,7 @@ static const struct file_operations mqsim_dev_fops = {
 	.unlocked_ioctl = mqsim_dev_ioctl,
 };
 
+/* The daemon opens /dev/<name> to mmap rings, poll for requests, and ioctl completions. */
 static struct miscdevice mqsim_miscdev = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name = NVMEV_MQSIM_DEVICE_NAME,
@@ -249,6 +369,11 @@ static struct miscdevice mqsim_miscdev = {
 
 static int nvmev_mqsim_proc_read(struct seq_file *m, void *data)
 {
+	s64 submit_count = atomic64_read(&mqsim_submit_cost_count);
+	s64 roundtrip_count = atomic64_read(&mqsim_roundtrip_count);
+	s64 late_count = atomic64_read(&mqsim_reply_late_count);
+
+	/* Human-readable IPC counters for debugging and experiment validation. */
 	seq_printf(m, "enabled: %u\n", mqsim_ipc_enable ? 1 : 0);
 	seq_printf(m, "transport: shared_memory\n");
 	seq_printf(m, "timeout_us: %u\n", mqsim_ipc_timeout_us);
@@ -268,6 +393,21 @@ static int nvmev_mqsim_proc_read(struct seq_file *m, void *data)
 	seq_printf(m, "req_ring_full: %lld\n", atomic64_read(&mqsim_req_ring_full));
 	seq_printf(m, "resp_ring_empty: %lld\n", atomic64_read(&mqsim_resp_ring_empty));
 	seq_printf(m, "late_replies: %lld\n", atomic64_read(&mqsim_late_replies));
+	seq_printf(m, "submit_cost_count: %lld\n", submit_count);
+	seq_printf(m, "submit_cost_avg_ns: %lld\n",
+		   submit_count ? atomic64_read(&mqsim_submit_cost_total_ns) / submit_count : 0);
+	seq_printf(m, "submit_cost_max_ns: %lld\n",
+		   atomic64_read(&mqsim_submit_cost_max_ns));
+	seq_printf(m, "roundtrip_count: %lld\n", roundtrip_count);
+	seq_printf(m, "roundtrip_avg_ns: %lld\n",
+		   roundtrip_count ? atomic64_read(&mqsim_roundtrip_total_ns) / roundtrip_count : 0);
+	seq_printf(m, "roundtrip_max_ns: %lld\n",
+		   atomic64_read(&mqsim_roundtrip_max_ns));
+	seq_printf(m, "reply_late_count: %lld\n", late_count);
+	seq_printf(m, "reply_late_avg_ns: %lld\n",
+		   late_count ? atomic64_read(&mqsim_reply_late_total_ns) / late_count : 0);
+	seq_printf(m, "reply_late_max_ns: %lld\n",
+		   atomic64_read(&mqsim_reply_late_max_ns));
 	seq_printf(m, "last_error: %d\n", mqsim_last_error);
 	return 0;
 }
@@ -295,6 +435,7 @@ static const struct file_operations mqsim_proc_fops = {
 
 static void nvmev_mqsim_shm_init(void)
 {
+	/* Initialize the shared-memory ABI visible to the daemon. */
 	memset(mqsim_shm, 0, sizeof(*mqsim_shm));
 	mqsim_shm->magic = NVMEV_MQSIM_MAGIC;
 	mqsim_shm->version = NVMEV_MQSIM_VERSION;
@@ -307,12 +448,14 @@ int nvmev_mqsim_ipc_init(void)
 {
 	int ret;
 
+	/* vmalloc_user() makes the buffer safe to map into userspace via mmap(). */
 	mqsim_shm = vmalloc_user(sizeof(*mqsim_shm));
 	if (!mqsim_shm)
 		return -ENOMEM;
 	nvmev_mqsim_shm_init();
 	hash_init(mqsim_pending_table);
 
+	/* Register the character device used by MQSimIPCDaemon. */
 	ret = misc_register(&mqsim_miscdev);
 	if (ret) {
 		vfree(mqsim_shm);
@@ -325,8 +468,9 @@ int nvmev_mqsim_ipc_init(void)
 		   NVMEV_MQSIM_DEVICE_NAME, mqsim_ipc_enable);
 
 	if (nvmev_vdev && nvmev_vdev->proc_root)
+		/* /proc/nvmev/mqsim_ipc exposes ring positions and health counters. */
 		mqsim_proc_entry = proc_create("mqsim_ipc", 0444, nvmev_vdev->proc_root,
-					       &mqsim_proc_fops);
+						       &mqsim_proc_fops);
 
 	return 0;
 }
@@ -348,6 +492,7 @@ void nvmev_mqsim_ipc_exit(void)
 	}
 	mqsim_daemon_connected = false;
 
+	/* Complete any remaining I/O before tearing down the shared memory. */
 	spin_lock(&mqsim_pending_lock);
 	hash_for_each_safe(mqsim_pending_table, bucket, tmp, pending, node) {
 		hash_del(&pending->node);
@@ -357,6 +502,8 @@ void nvmev_mqsim_ipc_exit(void)
 		kfree(pending);
 	}
 	spin_unlock(&mqsim_pending_lock);
+
+	mqsim_print_timing_stats("module_exit");
 
 	if (mqsim_shm) {
 		vfree(mqsim_shm);
@@ -371,6 +518,8 @@ int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
 	struct nvme_rw_command *rw = &req->cmd->rw;
 	struct nvmev_mqsim_io_msg msg = { 0 };
 	struct mqsim_pending_io *pending;
+	u64 submit_begin_ns;
+	u64 submit_cost_ns;
 	s64 pending_now;
 	int ret;
 
@@ -380,20 +529,25 @@ int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
 	if (rw->opcode != nvme_cmd_read && rw->opcode != nvme_cmd_write)
 		return -EOPNOTSUPP;
 
+	/* Allocate the kernel-side handle used to match the later MQSim reply. */
 	pending = kzalloc(sizeof(*pending), GFP_KERNEL);
 	if (!pending)
 		return -ENOMEM;
 
+	submit_begin_ns = mqsim_now_ns();
 	mutex_lock(&mqsim_request_lock);
 
+	/* Assign a unique request_id and remember how to find the original I/O. */
 	pending->request_id = atomic64_inc_return(&mqsim_next_request_id);
 	pending->submit_time_ns = req->nsecs_start;
+	pending->ipc_submit_wall_ns = submit_begin_ns;
 	pending->fallback_target_ns = fallback_target_ns;
 	pending->worker_id = worker_id;
 	pending->work_entry = work_entry;
 	if (request_id)
 		*request_id = pending->request_id;
 
+	/* Send only logical I/O metadata to MQSim; data bytes stay in backing store. */
 	msg.magic = NVMEV_MQSIM_MAGIC;
 	msg.version = NVMEV_MQSIM_VERSION;
 	msg.type = NVMEV_MQSIM_MSG_IO_REQUEST;
@@ -406,6 +560,10 @@ int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
 	msg.slba = rw->slba;
 	msg.nlb = rw->length + 1;
 
+	/*
+	 * Bind the NVMeVirt worker entry before publishing to MQSim, then insert
+	 * into the pending hash table keyed by request_id.
+	 */
 	nvmev_mqsim_bind_io(worker_id, work_entry, pending->request_id);
 	spin_lock(&mqsim_pending_lock);
 	hash_add(mqsim_pending_table, &pending->node, pending->request_id);
@@ -415,6 +573,7 @@ int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
 
 	ret = mqsim_push_request(&msg);
 	if (ret < 0) {
+		/* If the daemon is absent or the ring is full, undo pending state. */
 		spin_lock(&mqsim_pending_lock);
 		hash_del(&pending->node);
 		atomic64_dec(&mqsim_pending_count);
@@ -431,5 +590,9 @@ int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
 
 out_unlock:
 	mutex_unlock(&mqsim_request_lock);
+	submit_cost_ns = mqsim_now_ns() - submit_begin_ns;
+	atomic64_inc(&mqsim_submit_cost_count);
+	atomic64_add(submit_cost_ns, &mqsim_submit_cost_total_ns);
+	mqsim_update_max(&mqsim_submit_cost_max_ns, submit_cost_ns);
 	return ret;
 }
