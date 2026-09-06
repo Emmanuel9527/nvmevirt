@@ -35,6 +35,7 @@ struct nvmev_mqsim_io_msg {
 
 	__u64 request_id;
 	__u64 submit_time_ns;
+	__u64 kernel_submit_wall_ns;
 
 	__u32 opcode;
 	__u32 nsid;

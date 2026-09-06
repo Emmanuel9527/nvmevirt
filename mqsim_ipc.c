@@ -18,6 +18,7 @@
 #include <linux/wait.h>
 
 #include "mqsim_ipc.h"
+#include "controller_timing.h"
 #include "mqsim_ipc_protocol.h"
 
 static bool mqsim_ipc_enable;
@@ -56,6 +57,21 @@ static atomic64_t mqsim_max_pending = ATOMIC64_INIT(0);
 static atomic64_t mqsim_submit_cost_count = ATOMIC64_INIT(0);
 static atomic64_t mqsim_submit_cost_total_ns = ATOMIC64_INIT(0);
 static atomic64_t mqsim_submit_cost_max_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_cmd_proc_count = ATOMIC64_INIT(0);
+static atomic64_t mqsim_cmd_proc_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_cmd_proc_max_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_enqueue_count = ATOMIC64_INIT(0);
+static atomic64_t mqsim_enqueue_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_enqueue_max_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_submit_call_count = ATOMIC64_INIT(0);
+static atomic64_t mqsim_submit_call_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_submit_call_max_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_response_consume_count = ATOMIC64_INIT(0);
+static atomic64_t mqsim_response_consume_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_response_consume_max_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_complete_call_count = ATOMIC64_INIT(0);
+static atomic64_t mqsim_complete_call_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mqsim_complete_call_max_ns = ATOMIC64_INIT(0);
 static atomic64_t mqsim_roundtrip_count = ATOMIC64_INIT(0);
 static atomic64_t mqsim_roundtrip_total_ns = ATOMIC64_INIT(0);
 static atomic64_t mqsim_roundtrip_max_ns = ATOMIC64_INIT(0);
@@ -110,6 +126,11 @@ static u64 mqsim_now_ns(void)
 	return local_clock();
 }
 
+static u64 mqsim_wall_now_ns(void)
+{
+	return ktime_get_ns();
+}
+
 static void mqsim_update_max(atomic64_t *counter, s64 value)
 {
 	s64 old;
@@ -158,9 +179,30 @@ static s64 mqsim_avg_or_zero(atomic64_t *total, s64 count)
 	return count ? atomic64_read(total) / count : 0;
 }
 
+void nvmev_mqsim_record_cmd_path_timing(u64 proc_ns, u64 enqueue_ns,
+					u64 submit_call_ns)
+{
+	atomic64_inc(&mqsim_cmd_proc_count);
+	atomic64_add(proc_ns, &mqsim_cmd_proc_total_ns);
+	mqsim_update_max(&mqsim_cmd_proc_max_ns, proc_ns);
+
+	atomic64_inc(&mqsim_enqueue_count);
+	atomic64_add(enqueue_ns, &mqsim_enqueue_total_ns);
+	mqsim_update_max(&mqsim_enqueue_max_ns, enqueue_ns);
+
+	atomic64_inc(&mqsim_submit_call_count);
+	atomic64_add(submit_call_ns, &mqsim_submit_call_total_ns);
+	mqsim_update_max(&mqsim_submit_call_max_ns, submit_call_ns);
+}
+
 static void mqsim_print_timing_stats(const char *reason)
 {
 	s64 submit_count = atomic64_read(&mqsim_submit_cost_count);
+	s64 cmd_proc_count = atomic64_read(&mqsim_cmd_proc_count);
+	s64 enqueue_count = atomic64_read(&mqsim_enqueue_count);
+	s64 submit_call_count = atomic64_read(&mqsim_submit_call_count);
+	s64 response_consume_count = atomic64_read(&mqsim_response_consume_count);
+	s64 complete_call_count = atomic64_read(&mqsim_complete_call_count);
 	s64 roundtrip_count = atomic64_read(&mqsim_roundtrip_count);
 	s64 late_count = atomic64_read(&mqsim_reply_late_count);
 
@@ -182,6 +224,25 @@ static void mqsim_print_timing_stats(const char *reason)
 		   roundtrip_count,
 		   mqsim_avg_or_zero(&mqsim_roundtrip_total_ns, roundtrip_count),
 		   atomic64_read(&mqsim_roundtrip_max_ns));
+	NVMEV_INFO("MQSim IPC timing summary (%s): cmd_proc_count=%lld cmd_proc_avg_ns=%lld cmd_proc_max_ns=%lld enqueue_count=%lld enqueue_avg_ns=%lld enqueue_max_ns=%lld submit_call_count=%lld submit_call_avg_ns=%lld submit_call_max_ns=%lld\n",
+		   reason,
+		   cmd_proc_count,
+		   mqsim_avg_or_zero(&mqsim_cmd_proc_total_ns, cmd_proc_count),
+		   atomic64_read(&mqsim_cmd_proc_max_ns),
+		   enqueue_count,
+		   mqsim_avg_or_zero(&mqsim_enqueue_total_ns, enqueue_count),
+		   atomic64_read(&mqsim_enqueue_max_ns),
+		   submit_call_count,
+		   mqsim_avg_or_zero(&mqsim_submit_call_total_ns, submit_call_count),
+		   atomic64_read(&mqsim_submit_call_max_ns));
+	NVMEV_INFO("MQSim IPC timing summary (%s): response_consume_count=%lld response_consume_avg_ns=%lld response_consume_max_ns=%lld complete_call_count=%lld complete_call_avg_ns=%lld complete_call_max_ns=%lld\n",
+		   reason,
+		   response_consume_count,
+		   mqsim_avg_or_zero(&mqsim_response_consume_total_ns, response_consume_count),
+		   atomic64_read(&mqsim_response_consume_max_ns),
+		   complete_call_count,
+		   mqsim_avg_or_zero(&mqsim_complete_call_total_ns, complete_call_count),
+		   atomic64_read(&mqsim_complete_call_max_ns));
 	NVMEV_INFO("MQSim IPC timing summary (%s): reply_late_count=%lld reply_late_avg_ns=%lld reply_late_max_ns=%lld\n",
 		   reason,
 		   late_count,
@@ -192,6 +253,8 @@ static void mqsim_print_timing_stats(const char *reason)
 static void mqsim_consume_responses(void)
 {
 	struct nvmev_mqsim_ring_header *ring = &mqsim_shm->resp_ring;
+	u64 consume_begin_ns = mqsim_now_ns();
+	u64 consumed = 0;
 
 	/*
 	 * Response-ring consumer.
@@ -245,6 +308,7 @@ static void mqsim_consume_responses(void)
 			} else {
 				/* Convert MQSim latency into NVMeVirt's absolute completion time. */
 				target_ns = completed->submit_time_ns + msg.latency_ns;
+				target_ns = nvmev_ctrl_timing_completion_done(target_ns, 0);
 				atomic64_inc(&mqsim_replies);
 			}
 
@@ -265,10 +329,28 @@ static void mqsim_consume_responses(void)
 				}
 			}
 
+			{
+				u64 complete_begin_ns = mqsim_now_ns();
+				u64 complete_call_ns;
+
 			nvmev_mqsim_complete_io(completed->worker_id, completed->work_entry,
 						completed->request_id, target_ns);
+				complete_call_ns = mqsim_now_ns() - complete_begin_ns;
+				atomic64_inc(&mqsim_complete_call_count);
+				atomic64_add(complete_call_ns, &mqsim_complete_call_total_ns);
+				mqsim_update_max(&mqsim_complete_call_max_ns, complete_call_ns);
+			}
+			consumed++;
 			kfree(completed);
 		}
+	}
+
+	if (consumed > 0) {
+		u64 consume_ns = mqsim_now_ns() - consume_begin_ns;
+
+		atomic64_inc(&mqsim_response_consume_count);
+		atomic64_add(consume_ns, &mqsim_response_consume_total_ns);
+		mqsim_update_max(&mqsim_response_consume_max_ns, consume_ns);
 	}
 }
 
@@ -370,6 +452,11 @@ static struct miscdevice mqsim_miscdev = {
 static int nvmev_mqsim_proc_read(struct seq_file *m, void *data)
 {
 	s64 submit_count = atomic64_read(&mqsim_submit_cost_count);
+	s64 cmd_proc_count = atomic64_read(&mqsim_cmd_proc_count);
+	s64 enqueue_count = atomic64_read(&mqsim_enqueue_count);
+	s64 submit_call_count = atomic64_read(&mqsim_submit_call_count);
+	s64 response_consume_count = atomic64_read(&mqsim_response_consume_count);
+	s64 complete_call_count = atomic64_read(&mqsim_complete_call_count);
 	s64 roundtrip_count = atomic64_read(&mqsim_roundtrip_count);
 	s64 late_count = atomic64_read(&mqsim_reply_late_count);
 
@@ -398,6 +485,31 @@ static int nvmev_mqsim_proc_read(struct seq_file *m, void *data)
 		   submit_count ? atomic64_read(&mqsim_submit_cost_total_ns) / submit_count : 0);
 	seq_printf(m, "submit_cost_max_ns: %lld\n",
 		   atomic64_read(&mqsim_submit_cost_max_ns));
+	seq_printf(m, "cmd_proc_count: %lld\n", cmd_proc_count);
+	seq_printf(m, "cmd_proc_avg_ns: %lld\n",
+		   mqsim_avg_or_zero(&mqsim_cmd_proc_total_ns, cmd_proc_count));
+	seq_printf(m, "cmd_proc_max_ns: %lld\n",
+		   atomic64_read(&mqsim_cmd_proc_max_ns));
+	seq_printf(m, "enqueue_count: %lld\n", enqueue_count);
+	seq_printf(m, "enqueue_avg_ns: %lld\n",
+		   mqsim_avg_or_zero(&mqsim_enqueue_total_ns, enqueue_count));
+	seq_printf(m, "enqueue_max_ns: %lld\n",
+		   atomic64_read(&mqsim_enqueue_max_ns));
+	seq_printf(m, "submit_call_count: %lld\n", submit_call_count);
+	seq_printf(m, "submit_call_avg_ns: %lld\n",
+		   mqsim_avg_or_zero(&mqsim_submit_call_total_ns, submit_call_count));
+	seq_printf(m, "submit_call_max_ns: %lld\n",
+		   atomic64_read(&mqsim_submit_call_max_ns));
+	seq_printf(m, "response_consume_count: %lld\n", response_consume_count);
+	seq_printf(m, "response_consume_avg_ns: %lld\n",
+		   mqsim_avg_or_zero(&mqsim_response_consume_total_ns, response_consume_count));
+	seq_printf(m, "response_consume_max_ns: %lld\n",
+		   atomic64_read(&mqsim_response_consume_max_ns));
+	seq_printf(m, "complete_call_count: %lld\n", complete_call_count);
+	seq_printf(m, "complete_call_avg_ns: %lld\n",
+		   mqsim_avg_or_zero(&mqsim_complete_call_total_ns, complete_call_count));
+	seq_printf(m, "complete_call_max_ns: %lld\n",
+		   atomic64_read(&mqsim_complete_call_max_ns));
 	seq_printf(m, "roundtrip_count: %lld\n", roundtrip_count);
 	seq_printf(m, "roundtrip_avg_ns: %lld\n",
 		   roundtrip_count ? atomic64_read(&mqsim_roundtrip_total_ns) / roundtrip_count : 0);
@@ -408,6 +520,7 @@ static int nvmev_mqsim_proc_read(struct seq_file *m, void *data)
 		   late_count ? atomic64_read(&mqsim_reply_late_total_ns) / late_count : 0);
 	seq_printf(m, "reply_late_max_ns: %lld\n",
 		   atomic64_read(&mqsim_reply_late_max_ns));
+	nvmev_ctrl_timing_proc_print(m);
 	seq_printf(m, "last_error: %d\n", mqsim_last_error);
 	return 0;
 }
@@ -512,8 +625,8 @@ void nvmev_mqsim_ipc_exit(void)
 }
 
 int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
-			     unsigned int work_entry, u64 fallback_target_ns,
-			     u64 *request_id)
+			     unsigned int work_entry, u64 backend_submit_time_ns,
+			     u64 fallback_target_ns, u64 *request_id)
 {
 	struct nvme_rw_command *rw = &req->cmd->rw;
 	struct nvmev_mqsim_io_msg msg = { 0 };
@@ -539,7 +652,7 @@ int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
 
 	/* Assign a unique request_id and remember how to find the original I/O. */
 	pending->request_id = atomic64_inc_return(&mqsim_next_request_id);
-	pending->submit_time_ns = req->nsecs_start;
+	pending->submit_time_ns = backend_submit_time_ns;
 	pending->ipc_submit_wall_ns = submit_begin_ns;
 	pending->fallback_target_ns = fallback_target_ns;
 	pending->worker_id = worker_id;
@@ -552,7 +665,8 @@ int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
 	msg.version = NVMEV_MQSIM_VERSION;
 	msg.type = NVMEV_MQSIM_MSG_IO_REQUEST;
 	msg.request_id = pending->request_id;
-	msg.submit_time_ns = req->nsecs_start;
+	msg.submit_time_ns = backend_submit_time_ns;
+	msg.kernel_submit_wall_ns = mqsim_wall_now_ns();
 	msg.opcode = rw->opcode == nvme_cmd_read ? NVMEV_MQSIM_IO_READ : NVMEV_MQSIM_IO_WRITE;
 	msg.nsid = rw->nsid;
 	msg.sqid = req->sq_id;

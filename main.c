@@ -26,6 +26,7 @@
 #include "kv_ftl.h"
 #include "dma.h"
 #include "mqsim_ipc.h"
+#include "path_stats.h"
 
 /****************************************************************
  * Memory Layout
@@ -681,6 +682,11 @@ static int NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 		NVMEV_STORAGE_FINAL(nvmev_vdev);
 		return -ENOMEM;
 	}
+	if (nvmev_path_stats_init(nvmev_vdev->proc_root, nvmev_vdev->config.nr_io_workers)) {
+		NVMEV_ERROR("Failed to create /proc/nvmev/path_stats\n");
+		NVMEV_STORAGE_FINAL(nvmev_vdev);
+		return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -697,6 +703,7 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 		return;
 
 	if (nvmev_vdev->proc_root) {
+		nvmev_path_stats_exit(nvmev_vdev->proc_root);
 		if (nvmev_vdev->proc_read_times) {
 			remove_proc_entry("read_times", nvmev_vdev->proc_root);
 			nvmev_vdev->proc_read_times = NULL;
