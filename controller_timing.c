@@ -13,11 +13,12 @@ static unsigned int ctrl_frontend_slots = 3;
 static unsigned int ctrl_completion_slots = 3;
 static unsigned int ctrl_submission_queue_depth = 1024;
 static unsigned int ctrl_completion_queue_depth = 1024;
-static unsigned long ctrl_command_fetch_ns = 1000;
-static unsigned long ctrl_command_decode_ns = 1000;
-static unsigned long ctrl_dispatch_overhead_ns = 3000;
-static unsigned long ctrl_cqe_write_ns = 1000;
-static unsigned long ctrl_interrupt_ns = 3000;
+/* Controller sensitivity experiment: frontend 10 us, completion 8 us. */
+static unsigned long ctrl_command_fetch_ns = 2000;
+static unsigned long ctrl_command_decode_ns = 2000;
+static unsigned long ctrl_dispatch_overhead_ns = 6000;
+static unsigned long ctrl_cqe_write_ns = 2000;
+static unsigned long ctrl_interrupt_ns = 6000;
 static unsigned long ctrl_dsp_ns;
 
 module_param(ctrl_timing_enable, bool, 0644);
