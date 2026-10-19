@@ -12,5 +12,12 @@ void nvmev_mqsim_record_cmd_path_timing(u64 proc_ns, u64 enqueue_ns,
 int nvmev_mqsim_submit_async(struct nvmev_request *req, unsigned int worker_id,
 			     unsigned int work_entry, u64 backend_submit_time_ns,
 			     u64 fallback_target_ns, u64 *request_id);
+int nvmev_mqsim_submit_vuc(struct nvmev_request *req, unsigned int worker_id,
+			   unsigned int work_entry, u64 backend_submit_time_ns,
+			   u64 fallback_target_ns, const void *payload,
+			   unsigned int payload_bytes, unsigned int opcode,
+			   u64 query_id, u64 batch_id, unsigned int result_capacity,
+			   unsigned int *slot_out, u64 *request_id);
+void nvmev_mqsim_vuc_release_slot(unsigned int slot);
 
 #endif /* NVMEVIRT_MQSIM_IPC_H */

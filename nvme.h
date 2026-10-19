@@ -328,6 +328,8 @@ struct nvme_reservation_status {
 	op(nvme_cmd_kv_iter_read, 0xB2) \
 	op(nvme_cmd_kv_exist, 0xB3) \
 	op(nvme_cmd_kv_batch, 0x85) \
+	/* Vendor-specific C2H result-fetch command. */ \
+	op(nvme_cmd_vuc_fetch_batch_result, 0xC0)
 
 #define ENUM_NVME_OP(name, value) name = value,
 #define STRING_NVME_OP(name, value) [name] = #name,

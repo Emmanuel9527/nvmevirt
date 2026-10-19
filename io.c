@@ -11,7 +11,9 @@
 #include "controller_timing.h"
 #include "dma.h"
 #include "mqsim_ipc.h"
+#include "mqsim_ipc_protocol.h"
 #include "path_stats.h"
+#include "vuc_protocol.h"
 
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS))
 #include "ssd.h"
@@ -25,6 +27,99 @@ struct buffer;
 #define cq_entry(entry_id) cq->cq[CQ_ENTRY_TO_PAGE_NUM(entry_id)][CQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
 
 extern bool io_using_dma;
+
+/* Map one physical PRP page for the software PCIe device's emulated DMA. */
+static void *nvmev_map_prp_page(u64 paddr, bool *is_memremapped)
+{
+	unsigned long page_addr = paddr & PAGE_MASK;
+	*is_memremapped = false;
+	if (pfn_valid(page_addr >> PAGE_SHIFT))
+		return kmap_atomic_pfn(PRP_PFN(page_addr));
+	*is_memremapped = true;
+	return memremap(page_addr, PAGE_SIZE, MEMREMAP_WT);
+}
+
+/* Copy a bounded VUC transfer through PRP1/PRP2 without touching namespace data. */
+static int nvmev_copy_vuc_prps(struct nvme_common_command *cmd, void *buffer,
+			       size_t bytes, size_t transfer_bytes, bool device_to_host)
+{
+	u64 pages[17] = {};
+	u64 prp1 = le64_to_cpu(cmd->prp1);
+	u64 prp2 = le64_to_cpu(cmd->prp2);
+	size_t first, remaining, page_count, offset = 0;
+	unsigned int i;
+	bool list_memremapped = false;
+	void *list_page = NULL;
+
+	if (!bytes || bytes > transfer_bytes ||
+	    transfer_bytes > NVMEV_MQSIM_VUC_SLOT_BYTES || !buffer || !prp1)
+		return -EINVAL;
+	pages[0] = prp1;
+	first = min_t(size_t, bytes, PAGE_SIZE - (prp1 & PAGE_OFFSET_MASK));
+	remaining = bytes - first;
+	page_count = 1;
+	if (!remaining)
+		goto copy_pages;
+	if (!prp2)
+		return -EINVAL;
+	/* PRP2 describes the full Host mapping, even when copying a short reply.
+	 * A short FETCH must not treat the Host's PRP list as a data page.
+	 */
+	if (transfer_bytes - first <= PAGE_SIZE) {
+		if (prp2 & PAGE_OFFSET_MASK)
+			return -EINVAL;
+		pages[page_count++] = prp2;
+	} else {
+		/* A bounded transfer uses one PRP list; reject a list requiring chaining.
+		 * The first list may have an offset, but must contain all entries.
+		 */
+		if ((prp2 & (sizeof(u64) - 1)) ||
+		    DIV_ROUND_UP(remaining, PAGE_SIZE) >
+		    (PAGE_SIZE - (prp2 & PAGE_OFFSET_MASK)) / sizeof(u64))
+			return -EINVAL;
+		list_page = nvmev_map_prp_page(prp2, &list_memremapped);
+		if (!list_page)
+			return -EFAULT;
+		for (i = 0; remaining && i < ARRAY_SIZE(pages) - 1; i++) {
+			u64 page = le64_to_cpu(((__le64 *)((u8 *)list_page +
+					(prp2 & PAGE_OFFSET_MASK)))[i]);
+			if (!page || (page & PAGE_OFFSET_MASK))
+				break;
+			pages[page_count++] = page;
+			remaining -= min_t(size_t, remaining, PAGE_SIZE);
+		}
+		if (list_memremapped)
+			memunmap(list_page);
+		else
+			kunmap_atomic(list_page);
+		if (remaining)
+			return -EINVAL;
+		remaining = bytes - first;
+	}
+
+copy_pages:
+	remaining = bytes;
+	for (i = 0; i < page_count && remaining; i++) {
+		bool memremapped;
+		void *mapped;
+		size_t in_page = i == 0 ? (pages[i] & PAGE_OFFSET_MASK) : 0;
+		size_t chunk = min_t(size_t, remaining, PAGE_SIZE - in_page);
+		mapped = nvmev_map_prp_page(pages[i], &memremapped);
+		if (!mapped)
+			return -EFAULT;
+		if (device_to_host)
+			memcpy((u8 *)mapped + in_page, (u8 *)buffer + offset, chunk);
+		else
+			memcpy((u8 *)buffer + offset, (u8 *)mapped + in_page, chunk);
+		if (memremapped)
+			memunmap(mapped);
+		else
+			kunmap_atomic(mapped);
+		offset += chunk;
+		remaining -= chunk;
+	}
+	return remaining ? -EINVAL : 0;
+}
 
 static inline unsigned int __get_io_worker(int sqid)
 {
@@ -319,7 +414,8 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(int sqid, unsigned in
 }
 
 static bool __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long long nsecs_start,
-			     struct nvmev_result *ret, unsigned int *worker_id,
+			     struct nvmev_result *ret, bool is_vuc,
+			     unsigned int vuc_opcode, unsigned int *worker_id,
 			     unsigned int *work_entry)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
@@ -349,8 +445,16 @@ static bool __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 	w->result0 = (unsigned int)(ret->result & 0xFFFFFFFF);
 	w->result1 = (unsigned int)(ret->result >> 32);
 	w->mqsim_request_id = 0;
+	/* Publish VUC state before linking the work item where the worker can see it. */
+	w->is_vuc = is_vuc;
+	w->vuc_slot = 0;
+	w->vuc_response_bytes = 0;
+	w->vuc_opcode = is_vuc ? vuc_opcode : 0;
+	w->vuc_result_buffer = NULL;
+	w->vuc_slot_valid = false;
 	w->is_completed = false;
-	w->is_copied = false;
+	/* Failed commands must not touch PRP data buffers in the worker. */
+	w->is_copied = is_vuc || ret->status != NVME_SC_SUCCESS;
 	w->prev = -1;
 	w->next = -1;
 
@@ -387,7 +491,8 @@ void nvmev_mqsim_complete_io(unsigned int worker_id, unsigned int work_entry,
 	struct nvmev_io_worker *worker;
 	struct nvmev_io_work *w;
 
-	if (!nvmev_vdev || worker_id >= nvmev_vdev->config.nr_io_workers ||
+	if (!nvmev_vdev || !nvmev_vdev->io_workers ||
+	    worker_id >= nvmev_vdev->config.nr_io_workers ||
 	    work_entry >= NR_MAX_PARALLEL_IO)
 		return;
 
@@ -396,8 +501,42 @@ void nvmev_mqsim_complete_io(unsigned int worker_id, unsigned int work_entry,
 	if (READ_ONCE(w->mqsim_request_id) != request_id || READ_ONCE(w->is_completed))
 		return;
 
-	WRITE_ONCE(w->nsecs_target, nsecs_target);
+	smp_store_release(&w->nsecs_target, nsecs_target);
 	wake_up_process(worker->task_struct);
+}
+
+void nvmev_mqsim_complete_vuc(unsigned int worker_id, unsigned int work_entry,
+			      uint64_t request_id, unsigned long long nsecs_target,
+			      unsigned int status, unsigned int response_bytes,
+			      unsigned int slot, unsigned int opcode,
+			      void *result_buffer)
+{
+	struct nvmev_io_worker *worker;
+	struct nvmev_io_work *w;
+
+	if (!nvmev_vdev || !nvmev_vdev->io_workers ||
+	    worker_id >= nvmev_vdev->config.nr_io_workers ||
+	    work_entry >= NR_MAX_PARALLEL_IO)
+		goto discard;
+	worker = &nvmev_vdev->io_workers[worker_id];
+	w = &worker->work_queue[work_entry];
+	if (READ_ONCE(w->mqsim_request_id) != request_id || READ_ONCE(w->is_completed))
+		goto discard;
+	w->status = status;
+	w->result0 = response_bytes;
+	w->vuc_slot = slot;
+	w->vuc_response_bytes = response_bytes;
+	w->vuc_opcode = opcode;
+	w->vuc_result_buffer = result_buffer;
+	w->vuc_slot_valid = opcode == NVMEV_VUC_OPCODE_FETCH_BATCH_RESULT;
+	smp_store_release(&w->nsecs_target, nsecs_target);
+	wake_up_process(worker->task_struct);
+	return;
+
+discard:
+	kfree(result_buffer);
+	if (opcode == NVMEV_VUC_OPCODE_FETCH_BATCH_RESULT)
+		nvmev_mqsim_vuc_release_slot(slot);
 }
 
 void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
@@ -421,6 +560,9 @@ void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 	w->nsecs_start = w->nsecs_enqueue = local_clock();
 	w->nsecs_target = nsecs_target;
 	w->mqsim_request_id = 0;
+	w->is_vuc = false;
+	w->vuc_slot_valid = false;
+	w->vuc_result_buffer = NULL;
 	w->is_completed = false;
 	w->is_copied = true;
 	w->prev = -1;
@@ -496,7 +638,8 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 #else
 	uint32_t nsid = cmd->common.nsid - 1;
 #endif
-	struct nvmev_ns *ns = &nvmev_vdev->ns[nsid];
+	struct nvmev_ns *ns = nsid < nvmev_vdev->nr_ns ?
+		&nvmev_vdev->ns[nsid] : &nvmev_vdev->ns[0];
 
 	struct nvmev_request req = {
 		.cmd = cmd,
@@ -510,6 +653,16 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	unsigned int mqsim_worker_id = 0;
 	unsigned int mqsim_work_entry = 0;
 	bool mqsim_async = false;
+	bool vuc_expand_command = cmd->common.opcode == nvme_cmd_write &&
+		le64_to_cpu(cmd->rw.slba) == NVMEV_VUC_STAGE_SLBA;
+	bool vuc_command = vuc_expand_command ||
+		cmd->common.opcode == nvme_cmd_vuc_fetch_batch_result;
+	void *vuc_payload = NULL;
+	unsigned int vuc_payload_bytes = 0;
+	unsigned int vuc_transfer_bytes = 0;
+	unsigned int vuc_result_capacity = 0;
+	u64 vuc_query_id = 0;
+	u64 vuc_batch_id = 0;
 	u64 local_target_ns;
 	u64 mqsim_backend_submit_ns = 0;
 	u64 mqsim_proc_begin_ns = 0;
@@ -531,21 +684,73 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	if (nvmev_mqsim_ipc_enabled())
 		mqsim_proc_begin_ns = local_clock();
 
-	if (!ns->proc_io_cmd(ns, &req, &ret))
+	if (nsid >= nvmev_vdev->nr_ns) {
+		ret.status = NVME_SC_INVALID_NS;
+	} else if (vuc_command) {
+		if (cmd->common.nsid == 0 || nsid >= nvmev_vdev->nr_ns) {
+			ret.status = NVME_SC_INVALID_NS;
+		} else if (!nvmev_mqsim_ipc_enabled()) {
+			ret.status = NVME_SC_INVALID_OPCODE;
+		} else if (vuc_expand_command) {
+			struct nvmev_vuc_expand_filter_request request;
+			vuc_transfer_bytes = __cmd_io_size(&cmd->rw);
+			vuc_payload_bytes = le32_to_cpu(cmd->common.cdw10[3]);
+			if (vuc_payload_bytes < sizeof(request) ||
+			    vuc_payload_bytes > vuc_transfer_bytes ||
+			    vuc_transfer_bytes > NVMEV_MQSIM_VUC_SLOT_BYTES) {
+				ret.status = NVME_SC_INVALID_FIELD;
+			} else {
+				vuc_payload = kmalloc(vuc_transfer_bytes, GFP_KERNEL);
+				if (!vuc_payload || nvmev_copy_vuc_prps(&cmd->common, vuc_payload,
+								vuc_transfer_bytes, vuc_transfer_bytes, false) < 0) {
+					kfree(vuc_payload);
+					vuc_payload = NULL;
+					ret.status = NVME_SC_DATA_XFER_ERROR;
+				} else {
+					memcpy(&request, vuc_payload, sizeof(request));
+					if (request.abi_version != NVMEV_VUC_ABI_VERSION ||
+					    request.opcode != NVMEV_VUC_OPCODE_EXPAND_AND_FILTER_BATCH) {
+						kfree(vuc_payload);
+						vuc_payload = NULL;
+						ret.status = NVME_SC_INVALID_FIELD;
+					} else {
+						vuc_query_id = request.query_id;
+						vuc_batch_id = request.batch_id;
+					}
+				}
+			}
+		} else {
+			vuc_query_id = (u64)le32_to_cpu(cmd->common.cdw10[0]) |
+				((u64)le32_to_cpu(cmd->common.cdw10[1]) << 32);
+			vuc_batch_id = (u64)le32_to_cpu(cmd->common.cdw10[2]) |
+				((u64)le32_to_cpu(cmd->common.cdw10[3]) << 32);
+			vuc_result_capacity = le32_to_cpu(cmd->common.cdw10[4]);
+			if (!vuc_result_capacity ||
+			    vuc_result_capacity > NVMEV_MQSIM_VUC_SLOT_BYTES)
+				ret.status = NVME_SC_INVALID_FIELD;
+		}
+	} else if (!ns->proc_io_cmd(ns, &req, &ret)) {
 		return false;
+	}
 
 	if (nvmev_mqsim_ipc_enabled())
 		mqsim_proc_end_ns = local_clock();
 
 	local_target_ns = ret.nsecs_target;
-	if (nvmev_mqsim_ipc_enabled() &&
+	if (vuc_command && ret.status == NVME_SC_SUCCESS) {
+		mqsim_async = true;
+		mqsim_backend_submit_ns = nvmev_ctrl_timing_frontend_done(nsecs_start, sqid);
+		ret.nsecs_target = U64_MAX;
+	} else if (!vuc_command && ret.status == NVME_SC_SUCCESS &&
+	    nvmev_mqsim_ipc_enabled() &&
 	    (cmd->rw.opcode == nvme_cmd_read || cmd->rw.opcode == nvme_cmd_write)) {
 		mqsim_async = true;
 		mqsim_backend_submit_ns = nvmev_ctrl_timing_frontend_done(nsecs_start, sqid);
 		ret.nsecs_target = U64_MAX;
 	}
 
-	*io_size = __cmd_io_size(&sq_entry(sq_entry).rw);
+	*io_size = vuc_command ? (vuc_transfer_bytes ? vuc_transfer_bytes : vuc_result_capacity) :
+		__cmd_io_size(&sq_entry(sq_entry).rw);
 
 #ifdef PERF_DEBUG
 	prev_clock2 = local_clock();
@@ -555,8 +760,11 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 		mqsim_enqueue_begin_ns = local_clock();
 
 	if (!__enqueue_io_req(sqid, sq->cqid, sq_entry, nsecs_start, &ret,
-			      &mqsim_worker_id, &mqsim_work_entry))
+			      vuc_command, cmd->common.opcode,
+			      &mqsim_worker_id, &mqsim_work_entry)) {
+		kfree(vuc_payload);
 		return false;
+	}
 
 	if (mqsim_async)
 		mqsim_enqueue_end_ns = local_clock();
@@ -564,7 +772,17 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	if (mqsim_async) {
 		u64 mqsim_request_id = 0;
 		u64 mqsim_submit_begin_ns = local_clock();
-		int mqsim_ret = nvmev_mqsim_submit_async(&req, mqsim_worker_id,
+		int mqsim_ret;
+		if (vuc_command)
+			mqsim_ret = nvmev_mqsim_submit_vuc(&req, mqsim_worker_id,
+				mqsim_work_entry, mqsim_backend_submit_ns, local_target_ns,
+				vuc_payload, vuc_payload_bytes,
+				vuc_expand_command ? NVMEV_VUC_OPCODE_EXPAND_AND_FILTER_BATCH :
+				cmd->common.opcode,
+				vuc_query_id, vuc_batch_id, vuc_result_capacity,
+				NULL, &mqsim_request_id);
+		else
+			mqsim_ret = nvmev_mqsim_submit_async(&req, mqsim_worker_id,
 							 mqsim_work_entry,
 							 mqsim_backend_submit_ns,
 							 local_target_ns,
@@ -578,10 +796,14 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 		if (mqsim_ret < 0) {
 			NVMEV_ERROR_RATELIMITED("MQSim IPC async submit failed (%d); using local timing model\n",
 						mqsim_ret);
+			if (vuc_command)
+				nvmev_vdev->io_workers[mqsim_worker_id].work_queue[mqsim_work_entry].status =
+					NVME_SC_INTERNAL;
 			nvmev_mqsim_complete_io(mqsim_worker_id, mqsim_work_entry,
 						mqsim_request_id, local_target_ns);
 		}
 	}
+	kfree(vuc_payload);
 
 #ifdef PERF_DEBUG
 	prev_clock3 = local_clock();
@@ -775,7 +997,21 @@ static int nvmev_io_worker(void *data)
 					    w->sqid, w->cqid, w->sq_entry);
 			}
 
-			if (w->nsecs_target <= curr_nsecs) {
+			if (smp_load_acquire(&w->nsecs_target) <= curr_nsecs) {
+				if (w->is_vuc && w->vuc_slot_valid) {
+					struct nvmev_submission_queue *sq = nvmev_vdev->sqes[w->sqid];
+					if (w->vuc_result_buffer && w->vuc_response_bytes &&
+					    nvmev_copy_vuc_prps(&sq_entry(w->sq_entry).common,
+								w->vuc_result_buffer,
+								w->vuc_response_bytes,
+								le32_to_cpu(sq_entry(w->sq_entry).common.cdw10[4]),
+								true) < 0)
+						w->status = NVME_SC_DATA_XFER_ERROR;
+					kfree(w->vuc_result_buffer);
+					w->vuc_result_buffer = NULL;
+					nvmev_mqsim_vuc_release_slot(w->vuc_slot);
+					w->vuc_slot_valid = false;
+				}
 				if (w->is_internal) {
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS))
 					buffer_release((struct buffer *)w->write_buffer,
@@ -925,6 +1161,15 @@ void NVMEV_IO_WORKER_FINAL(struct nvmev_dev *nvmev_vdev)
 			worker->task_struct = NULL;
 		}
 
+		if (worker->work_queue) {
+			unsigned int entry;
+			for (entry = 0; entry < NR_MAX_PARALLEL_IO; entry++) {
+				struct nvmev_io_work *w = &worker->work_queue[entry];
+				kfree(w->vuc_result_buffer);
+				if (w->vuc_slot_valid)
+					nvmev_mqsim_vuc_release_slot(w->vuc_slot);
+			}
+		}
 		kfree(worker->work_queue);
 		worker->work_queue = NULL;
 	}

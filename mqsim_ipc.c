@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/atomic.h>
+#include <linux/bitops.h>
 #include <linux/fs.h>
 #include <linux/hashtable.h>
 #include <linux/miscdevice.h>
@@ -20,6 +21,7 @@
 #include "mqsim_ipc.h"
 #include "controller_timing.h"
 #include "mqsim_ipc_protocol.h"
+#include "vuc_protocol.h"
 
 static bool mqsim_ipc_enable;
 static unsigned int mqsim_ipc_timeout_us = 1000;
@@ -88,6 +90,10 @@ struct mqsim_pending_io {
 	u64 fallback_target_ns;
 	unsigned int worker_id;
 	unsigned int work_entry;
+	unsigned int vuc_slot;
+	unsigned int vuc_opcode;
+	unsigned int result_capacity;
+	bool is_vuc;
 };
 
 /*
@@ -100,6 +106,35 @@ struct mqsim_pending_io {
  */
 static DEFINE_HASHTABLE(mqsim_pending_table, 10);
 static DEFINE_SPINLOCK(mqsim_pending_lock);
+static DEFINE_SPINLOCK(mqsim_vuc_slot_lock);
+static unsigned long mqsim_vuc_slot_bitmap;
+
+static int mqsim_vuc_slot_alloc(void)
+{
+	unsigned long flags;
+	unsigned int slot;
+	int result = -ENOSPC;
+
+	spin_lock_irqsave(&mqsim_vuc_slot_lock, flags);
+	for (slot = 0; slot < NVMEV_MQSIM_VUC_SLOT_COUNT; slot++) {
+		if (!test_and_set_bit(slot, &mqsim_vuc_slot_bitmap)) {
+			result = (int)slot;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&mqsim_vuc_slot_lock, flags);
+	return result;
+}
+
+static void mqsim_vuc_slot_free(unsigned int slot)
+{
+	unsigned long flags;
+	if (slot >= NVMEV_MQSIM_VUC_SLOT_COUNT)
+		return;
+	spin_lock_irqsave(&mqsim_vuc_slot_lock, flags);
+	clear_bit(slot, &mqsim_vuc_slot_bitmap);
+	spin_unlock_irqrestore(&mqsim_vuc_slot_lock, flags);
+}
 
 bool nvmev_mqsim_ipc_enabled(void)
 {
@@ -145,12 +180,23 @@ static void mqsim_update_max(atomic64_t *counter, s64 value)
 
 static int mqsim_push_request(const struct nvmev_mqsim_io_msg *msg)
 {
-	struct nvmev_mqsim_ring_header *ring = &mqsim_shm->req_ring;
+	struct nvmev_mqsim_ring_header *ring;
+	struct nvmev_mqsim_io_msg *entries;
+	u32 mask;
 	u32 tail;
 
 	if (!mqsim_daemon_connected)
 		return -ENOTCONN;
 
+	if (msg->type == NVMEV_MQSIM_MSG_VUC_REQUEST) {
+		ring = &mqsim_shm->vuc_req_ring;
+		entries = mqsim_shm->vuc_req_entries;
+		mask = NVMEV_MQSIM_VUC_RING_MASK;
+	} else {
+		ring = &mqsim_shm->req_ring;
+		entries = mqsim_shm->req_entries;
+		mask = NVMEV_MQSIM_RING_MASK;
+	}
 	if (ring_full(ring)) {
 		atomic64_inc(&mqsim_req_ring_full);
 		WRITE_ONCE(ring->dropped, READ_ONCE(ring->dropped) + 1);
@@ -158,7 +204,7 @@ static int mqsim_push_request(const struct nvmev_mqsim_io_msg *msg)
 	}
 
 	tail = READ_ONCE(ring->tail);
-	memcpy(&mqsim_shm->req_entries[tail & NVMEV_MQSIM_RING_MASK], msg, sizeof(*msg));
+	memcpy(&entries[tail & mask], msg, sizeof(*msg));
 	/* Publish the entry contents before advancing tail for the daemon. */
 	smp_wmb();
 	WRITE_ONCE(ring->tail, tail + 1);
@@ -252,9 +298,9 @@ static void mqsim_print_timing_stats(const char *reason)
 
 static void mqsim_consume_responses(void)
 {
-	struct nvmev_mqsim_ring_header *ring = &mqsim_shm->resp_ring;
 	u64 consume_begin_ns = mqsim_now_ns();
 	u64 consumed = 0;
+	unsigned int ring_id;
 
 	/*
 	 * Response-ring consumer.
@@ -264,17 +310,24 @@ static void mqsim_consume_responses(void)
 	 * the pending table, and completes the original NVMeVirt I/O at the
 	 * simulated target time.
 	 */
-	while (!ring_empty(ring)) {
+	for (ring_id = 0; ring_id < 2; ring_id++) {
+		struct nvmev_mqsim_ring_header *ring = ring_id ?
+			&mqsim_shm->vuc_resp_ring : &mqsim_shm->resp_ring;
+		struct nvmev_mqsim_io_msg *entries = ring_id ?
+			mqsim_shm->vuc_resp_entries : mqsim_shm->resp_entries;
+		while (!ring_empty(ring)) {
 		struct nvmev_mqsim_io_msg msg;
 		u32 head = READ_ONCE(ring->head);
 
-		/* Read the published completion after observing the ring head. */
+		/* Observe the producer tail before reading its published completion. */
 		smp_rmb();
-		memcpy(&msg, &mqsim_shm->resp_entries[head & NVMEV_MQSIM_RING_MASK], sizeof(msg));
-		WRITE_ONCE(ring->head, head + 1);
+		memcpy(&msg, &entries[head & (ring_id ? NVMEV_MQSIM_VUC_RING_MASK :
+							      NVMEV_MQSIM_RING_MASK)], sizeof(msg));
+		smp_store_release(&ring->head, head + 1);
 
 		if (msg.magic != NVMEV_MQSIM_MAGIC || msg.version != NVMEV_MQSIM_VERSION ||
-		    msg.type != NVMEV_MQSIM_MSG_IO_REPLY)
+		    (ring_id == 0 && msg.type != NVMEV_MQSIM_MSG_IO_REPLY) ||
+		    (ring_id == 1 && msg.type != NVMEV_MQSIM_MSG_VUC_REPLY))
 			continue;
 
 		{
@@ -284,7 +337,8 @@ static void mqsim_consume_responses(void)
 
 			spin_lock(&mqsim_pending_lock);
 			hash_for_each_possible(mqsim_pending_table, pending, node, msg.request_id) {
-				if (pending->request_id != msg.request_id)
+				if (pending->request_id != msg.request_id ||
+				    pending->is_vuc != (ring_id != 0))
 					continue;
 
 				hash_del(&pending->node);
@@ -300,7 +354,10 @@ static void mqsim_consume_responses(void)
 				continue;
 			}
 
-			if (msg.status < 0) {
+			if (completed->is_vuc) {
+				target_ns = completed->submit_time_ns + msg.latency_ns;
+				target_ns = nvmev_ctrl_timing_completion_done(target_ns, 0);
+			} else if (msg.status < 0) {
 				/* MQSim reported an error; fall back to NVMeVirt's local timing. */
 				target_ns = completed->fallback_target_ns;
 				atomic64_inc(&mqsim_fallbacks);
@@ -333,8 +390,42 @@ static void mqsim_consume_responses(void)
 				u64 complete_begin_ns = mqsim_now_ns();
 				u64 complete_call_ns;
 
-			nvmev_mqsim_complete_io(completed->worker_id, completed->work_entry,
+			if (completed->is_vuc) {
+				unsigned int nvme_status = NVME_SC_SUCCESS;
+				void *result_buffer = NULL;
+				if (msg.status == NVMEV_MQSIM_VUC_INVALID_ARGUMENT ||
+				    msg.status == NVMEV_MQSIM_VUC_INVALID_BUFFER ||
+				    msg.status == 2)
+					nvme_status = NVME_SC_INVALID_FIELD;
+				else if (msg.status == NVMEV_MQSIM_VUC_RESULT_OVERFLOW)
+					nvme_status = NVME_SC_DATA_XFER_ERROR;
+				else if (msg.status != NVMEV_MQSIM_VUC_SUCCESS)
+					nvme_status = NVME_SC_INTERNAL;
+				if (completed->vuc_opcode == NVMEV_MQSIM_VUC_FETCH &&
+				    msg.response_bytes > completed->result_capacity)
+					nvme_status = NVME_SC_DATA_XFER_ERROR;
+				if (completed->vuc_opcode == NVMEV_MQSIM_VUC_FETCH &&
+				    nvme_status == NVME_SC_SUCCESS &&
+				    msg.response_bytes > 0 &&
+				    msg.response_bytes <= NVMEV_MQSIM_VUC_SLOT_BYTES)
+					result_buffer = kmemdup(
+						mqsim_shm->vuc_slots[completed->vuc_slot].payload,
+						msg.response_bytes, GFP_KERNEL);
+				if (completed->vuc_opcode == NVMEV_MQSIM_VUC_FETCH &&
+				    nvme_status == NVME_SC_SUCCESS &&
+				    msg.response_bytes && !result_buffer)
+					nvme_status = NVME_SC_INTERNAL;
+				nvmev_mqsim_complete_vuc(completed->worker_id,
+					completed->work_entry, completed->request_id, target_ns,
+					nvme_status, msg.response_bytes,
+					completed->vuc_slot, completed->vuc_opcode,
+					result_buffer);
+				if (completed->vuc_opcode == NVMEV_MQSIM_VUC_EXPAND)
+					mqsim_vuc_slot_free(completed->vuc_slot);
+			} else {
+				nvmev_mqsim_complete_io(completed->worker_id, completed->work_entry,
 						completed->request_id, target_ns);
+			}
 				complete_call_ns = mqsim_now_ns() - complete_begin_ns;
 				atomic64_inc(&mqsim_complete_call_count);
 				atomic64_add(complete_call_ns, &mqsim_complete_call_total_ns);
@@ -342,6 +433,7 @@ static void mqsim_consume_responses(void)
 			}
 			consumed++;
 			kfree(completed);
+		}
 		}
 	}
 
@@ -357,10 +449,22 @@ static void mqsim_consume_responses(void)
 static int mqsim_dev_open(struct inode *inode, struct file *file)
 {
 	/* Only one MQSim daemon may own the IPC device at a time. */
-	if (mqsim_daemon_connected)
+	mutex_lock(&mqsim_request_lock);
+	if (mqsim_daemon_connected) {
+		mutex_unlock(&mqsim_request_lock);
 		return -EBUSY;
-
+	}
+	/* Discard the previous daemon's requests/replies before reusing slots. */
+	WRITE_ONCE(mqsim_shm->req_ring.head, 0);
+	WRITE_ONCE(mqsim_shm->req_ring.tail, 0);
+	WRITE_ONCE(mqsim_shm->resp_ring.head, 0);
+	WRITE_ONCE(mqsim_shm->resp_ring.tail, 0);
+	WRITE_ONCE(mqsim_shm->vuc_req_ring.head, 0);
+	WRITE_ONCE(mqsim_shm->vuc_req_ring.tail, 0);
+	WRITE_ONCE(mqsim_shm->vuc_resp_ring.head, 0);
+	WRITE_ONCE(mqsim_shm->vuc_resp_ring.tail, 0);
 	mqsim_daemon_connected = true;
+	mutex_unlock(&mqsim_request_lock);
 	NVMEV_INFO("MQSim shared-memory IPC daemon connected\n");
 	return 0;
 }
@@ -371,6 +475,10 @@ static int mqsim_dev_release(struct inode *inode, struct file *file)
 	struct hlist_node *tmp;
 	int bucket;
 
+	/* Serialize disconnect with insertion/publication and response consumption.
+	 * Otherwise submit's failure path can free a pending entry already freed here.
+	 */
+	mutex_lock(&mqsim_request_lock);
 	mqsim_daemon_connected = false;
 
 	/*
@@ -383,12 +491,22 @@ static int mqsim_dev_release(struct inode *inode, struct file *file)
 		atomic64_dec(&mqsim_pending_count);
 
 		atomic64_inc(&mqsim_fallbacks);
-		nvmev_mqsim_complete_io(pending->worker_id, pending->work_entry,
+		if (pending->is_vuc) {
+			nvmev_mqsim_complete_vuc(pending->worker_id, pending->work_entry,
+				pending->request_id, pending->fallback_target_ns,
+				NVME_SC_INTERNAL, 0, pending->vuc_slot,
+				pending->vuc_opcode, NULL);
+			if (pending->vuc_opcode == NVMEV_MQSIM_VUC_EXPAND)
+				mqsim_vuc_slot_free(pending->vuc_slot);
+		} else {
+			nvmev_mqsim_complete_io(pending->worker_id, pending->work_entry,
 					pending->request_id, pending->fallback_target_ns);
+		}
 		kfree(pending);
 	}
 	spin_unlock(&mqsim_pending_lock);
 
+	mutex_unlock(&mqsim_request_lock);
 	mqsim_last_error = -ENOTCONN;
 	mqsim_print_timing_stats("daemon_disconnect");
 	NVMEV_INFO("MQSim shared-memory IPC daemon disconnected\n");
@@ -415,7 +533,7 @@ static __poll_t mqsim_dev_poll(struct file *file, poll_table *wait)
 	 * req_ring and calls wake_up_interruptible().
 	 */
 	poll_wait(file, &mqsim_req_wq, wait);
-	if (!ring_empty(&mqsim_shm->req_ring))
+	if (!ring_empty(&mqsim_shm->req_ring) || !ring_empty(&mqsim_shm->vuc_req_ring))
 		mask |= EPOLLIN | EPOLLRDNORM;
 	return mask;
 }
@@ -425,7 +543,9 @@ static long mqsim_dev_ioctl(struct file *file, unsigned int cmd, unsigned long a
 	switch (cmd) {
 	case NVMEV_MQSIM_IOCTL_NOTIFY_RESP:
 		/* The daemon has published completions in resp_ring. Drain them. */
+		mutex_lock(&mqsim_request_lock);
 		mqsim_consume_responses();
+		mutex_unlock(&mqsim_request_lock);
 		return 0;
 	default:
 		return -ENOTTY;
@@ -466,10 +586,15 @@ static int nvmev_mqsim_proc_read(struct seq_file *m, void *data)
 	seq_printf(m, "timeout_us: %u\n", mqsim_ipc_timeout_us);
 	seq_printf(m, "daemon_connected: %u\n", mqsim_daemon_connected ? 1 : 0);
 	seq_printf(m, "ring_size: %u\n", NVMEV_MQSIM_RING_SIZE);
+	seq_printf(m, "vuc_ring_size: %u\n", NVMEV_MQSIM_VUC_RING_SIZE);
 	seq_printf(m, "req_head: %u\n", READ_ONCE(mqsim_shm->req_ring.head));
 	seq_printf(m, "req_tail: %u\n", READ_ONCE(mqsim_shm->req_ring.tail));
 	seq_printf(m, "resp_head: %u\n", READ_ONCE(mqsim_shm->resp_ring.head));
 	seq_printf(m, "resp_tail: %u\n", READ_ONCE(mqsim_shm->resp_ring.tail));
+	seq_printf(m, "vuc_req_head: %u\n", READ_ONCE(mqsim_shm->vuc_req_ring.head));
+	seq_printf(m, "vuc_req_tail: %u\n", READ_ONCE(mqsim_shm->vuc_req_ring.tail));
+	seq_printf(m, "vuc_resp_head: %u\n", READ_ONCE(mqsim_shm->vuc_resp_ring.head));
+	seq_printf(m, "vuc_resp_tail: %u\n", READ_ONCE(mqsim_shm->vuc_resp_ring.tail));
 	seq_printf(m, "requests: %lld\n", atomic64_read(&mqsim_requests));
 	seq_printf(m, "replies: %lld\n", atomic64_read(&mqsim_replies));
 	seq_printf(m, "pending: %lld\n", atomic64_read(&mqsim_pending_count));
@@ -555,6 +680,8 @@ static void nvmev_mqsim_shm_init(void)
 	mqsim_shm->ring_size = NVMEV_MQSIM_RING_SIZE;
 	mqsim_shm->req_ring.size = NVMEV_MQSIM_RING_SIZE;
 	mqsim_shm->resp_ring.size = NVMEV_MQSIM_RING_SIZE;
+	mqsim_shm->vuc_req_ring.size = NVMEV_MQSIM_VUC_RING_SIZE;
+	mqsim_shm->vuc_resp_ring.size = NVMEV_MQSIM_VUC_RING_SIZE;
 }
 
 int nvmev_mqsim_ipc_init(void)
@@ -610,8 +737,17 @@ void nvmev_mqsim_ipc_exit(void)
 	hash_for_each_safe(mqsim_pending_table, bucket, tmp, pending, node) {
 		hash_del(&pending->node);
 		atomic64_dec(&mqsim_pending_count);
-		nvmev_mqsim_complete_io(pending->worker_id, pending->work_entry,
+		if (pending->is_vuc) {
+			nvmev_mqsim_complete_vuc(pending->worker_id, pending->work_entry,
+				pending->request_id, pending->fallback_target_ns,
+				NVME_SC_INTERNAL, 0, pending->vuc_slot,
+				pending->vuc_opcode, NULL);
+			if (pending->vuc_opcode == NVMEV_MQSIM_VUC_EXPAND)
+				mqsim_vuc_slot_free(pending->vuc_slot);
+		} else {
+			nvmev_mqsim_complete_io(pending->worker_id, pending->work_entry,
 					pending->request_id, pending->fallback_target_ns);
+		}
 		kfree(pending);
 	}
 	spin_unlock(&mqsim_pending_lock);
@@ -709,4 +845,101 @@ out_unlock:
 	atomic64_add(submit_cost_ns, &mqsim_submit_cost_total_ns);
 	mqsim_update_max(&mqsim_submit_cost_max_ns, submit_cost_ns);
 	return ret;
+}
+
+int nvmev_mqsim_submit_vuc(struct nvmev_request *req, unsigned int worker_id,
+			   unsigned int work_entry, u64 backend_submit_time_ns,
+			   u64 fallback_target_ns, const void *payload,
+			   unsigned int payload_bytes, unsigned int opcode,
+			   u64 query_id, u64 batch_id, unsigned int result_capacity,
+			   unsigned int *slot_out, u64 *request_id)
+{
+	struct nvme_common_command *cmd = &req->cmd->common;
+	struct nvmev_mqsim_io_msg msg = { 0 };
+	struct mqsim_pending_io *pending;
+	int slot, ret;
+	u64 submit_begin_ns;
+	s64 pending_now;
+
+	if (!mqsim_ipc_enable || (opcode != NVMEV_MQSIM_VUC_EXPAND &&
+				 opcode != NVMEV_MQSIM_VUC_FETCH))
+		return -EOPNOTSUPP;
+	if ((opcode == NVMEV_MQSIM_VUC_EXPAND &&
+	     (!payload || payload_bytes < sizeof(struct nvmev_vuc_expand_filter_request) ||
+	      payload_bytes > NVMEV_MQSIM_VUC_SLOT_BYTES)) ||
+	    (opcode == NVMEV_MQSIM_VUC_FETCH &&
+	     (!result_capacity || result_capacity > NVMEV_MQSIM_VUC_SLOT_BYTES)))
+		return -EINVAL;
+	slot = mqsim_vuc_slot_alloc();
+	if (slot < 0)
+		return slot;
+	if (slot_out)
+		*slot_out = slot;
+	if (opcode == NVMEV_MQSIM_VUC_EXPAND) {
+		memset(mqsim_shm->vuc_slots[slot].payload, 0,
+		       NVMEV_MQSIM_VUC_SLOT_BYTES);
+		memcpy(mqsim_shm->vuc_slots[slot].payload, payload, payload_bytes);
+	}
+	pending = kzalloc(sizeof(*pending), GFP_KERNEL);
+	if (!pending) {
+		mqsim_vuc_slot_free(slot);
+		return -ENOMEM;
+	}
+	submit_begin_ns = mqsim_now_ns();
+	mutex_lock(&mqsim_request_lock);
+	pending->request_id = atomic64_inc_return(&mqsim_next_request_id);
+	pending->submit_time_ns = backend_submit_time_ns;
+	pending->ipc_submit_wall_ns = submit_begin_ns;
+	pending->fallback_target_ns = fallback_target_ns;
+	pending->worker_id = worker_id;
+	pending->work_entry = work_entry;
+	pending->vuc_slot = slot;
+	pending->vuc_opcode = opcode;
+	pending->result_capacity = result_capacity;
+	pending->is_vuc = true;
+	if (request_id)
+		*request_id = pending->request_id;
+	msg.magic = NVMEV_MQSIM_MAGIC;
+	msg.version = NVMEV_MQSIM_VERSION;
+	msg.type = NVMEV_MQSIM_MSG_VUC_REQUEST;
+	msg.request_id = pending->request_id;
+	msg.submit_time_ns = backend_submit_time_ns;
+	msg.kernel_submit_wall_ns = mqsim_wall_now_ns();
+	msg.opcode = opcode;
+	msg.nsid = cmd->nsid;
+	msg.sqid = req->sq_id;
+	msg.command_id = cmd->command_id;
+	msg.vuc_opcode = opcode;
+	msg.vuc_slot = slot;
+	msg.payload_bytes = opcode == NVMEV_MQSIM_VUC_EXPAND ?
+		payload_bytes : result_capacity;
+	msg.query_id = query_id;
+	msg.batch_id = batch_id;
+	nvmev_mqsim_bind_io(worker_id, work_entry, pending->request_id);
+	spin_lock(&mqsim_pending_lock);
+	hash_add(mqsim_pending_table, &pending->node, pending->request_id);
+	pending_now = atomic64_inc_return(&mqsim_pending_count);
+	mqsim_update_max_pending(pending_now);
+	spin_unlock(&mqsim_pending_lock);
+	ret = mqsim_push_request(&msg);
+	if (ret < 0) {
+		spin_lock(&mqsim_pending_lock);
+		hash_del(&pending->node);
+		atomic64_dec(&mqsim_pending_count);
+		spin_unlock(&mqsim_pending_lock);
+		atomic64_inc(&mqsim_send_errors);
+		mqsim_last_error = ret;
+		kfree(pending);
+		mqsim_vuc_slot_free(slot);
+	} else {
+		atomic64_inc(&mqsim_requests);
+		ret = 0;
+	}
+	mutex_unlock(&mqsim_request_lock);
+	return ret;
+}
+
+void nvmev_mqsim_vuc_release_slot(unsigned int slot)
+{
+	mqsim_vuc_slot_free(slot);
 }
